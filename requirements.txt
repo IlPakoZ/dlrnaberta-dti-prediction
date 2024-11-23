@@ -1,0 +1,7 @@
+fairseq
+datasets
+dataclasses
+torchmetrics
+numba
+librosa
+deepspeed
