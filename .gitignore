@@ -1,3 +1,4 @@
-data
-dataset
-pretrained
+prototype/data
+prototype/dataset
+prototype/pretrained
+prototype/*.csv
