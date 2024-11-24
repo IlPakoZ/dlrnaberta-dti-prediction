@@ -5,3 +5,4 @@ torchmetrics
 numba
 librosa
 deepspeed
+mpi4py
