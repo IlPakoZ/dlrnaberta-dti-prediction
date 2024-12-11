@@ -6,3 +6,6 @@ numba
 librosa
 deepspeed
 mpi4py
+optuna
+peft
+bitsandbytes

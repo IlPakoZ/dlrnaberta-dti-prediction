@@ -26,7 +26,7 @@ def __preprocess_fasta__(filename):
                 fasta_sequence = ""
                 continue
             fasta_sequence += line1.strip()
-            
+                
     mapping[unid] = fasta_sequence
     return mapping
 
@@ -34,7 +34,8 @@ def __preprocess_fasta__(filename):
 def __map_ens_to_seq__(ens_to_seq_mappings, uni_to_ens_mappings, filename):
     mapping = __preprocess_fasta__(filename)
     for k,v in mapping.items():
-        ens_to_seq_mappings[uni_to_ens_mappings[k]] = v 
+        if k in uni_to_ens_mappings:
+            ens_to_seq_mappings[uni_to_ens_mappings[k]] = v 
     return ens_to_seq_mappings
 
 def get_sequences(ensembl_ids, job_id = None, filename = "result.fasta.gz", extra = "extra.fasta.gz"):
@@ -62,12 +63,15 @@ def get_sequences(ensembl_ids, job_id = None, filename = "result.fasta.gz", extr
             if "jobStatus" in status:
                 if status["jobStatus"] == "FINISHED":
                     break
+            else:
+                break
             time.sleep(0.1)
 
     results_url = f"https://rest.uniprot.org/idmapping/stream/{job_id}"
     results_response = requests.get(results_url)
     results_response.raise_for_status()
     response = results_response.json()["results"]
+
     ens_to_seq_mappings = dict()
     uni_to_ens_mappings = dict()
     for res in response:
@@ -275,4 +279,4 @@ def preprocess_data(file, thr=900, job_id=None, train_size = 0.8,
     __save_data__(train, val, test, sequences, extra_sequences, prot_indexes_file, train_prot_file, 
                   val_prot_file, test_prot_file, train_inters_file, val_inters_file, test_inters_file, tokenizer_train_file)
 
-inters = preprocess_data("./data/9606.protein.links.v12.0.txt", job_id="18f99dfc70e1fa7599e18bd26014de8bc8708b55")
+inters = preprocess_data("./data/9606.protein.links.v12.0.txt")
