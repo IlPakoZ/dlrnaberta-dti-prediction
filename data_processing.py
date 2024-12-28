@@ -178,24 +178,22 @@ def __split_train_test__(processed_fastas_directory, proportion_train):
     """
     Creates a train and test split for the pretraining task. This function is called internally by "create_pretraining_files()".
     The input files are the compressed CSV files created by the "create_pretraining_files()" function. 
-    The outputs are uncompressed CSV files. Currently the output paths are hard-coded.
+    The outputs are uncompressed text files containing only sequences. Currently the output paths are hard-coded.
     Outputs are saved in the directory "./processed/dataset".
     If they don't exist, the directories will be created automatically.
     The sequences are shuffled before splitting. 
 
-    
-        Parameters:
-            processed_fastas_directory (str): the path to the directory containing the processed FASTA sequences.
-            proportion_train (float): the proportion of data to use in the training set. The rest will go to the test set.
+    Parameters:
+        processed_fastas_directory (str): the path to the directory containing the processed FASTA sequences.
+        proportion_train (float): the proportion of data to use in the training set. The rest will go to the test set.
  
     """          
     dataset_dir = "./processed/dataset/"
     train_dir = "./processed/dataset/train"
     test_dir = "./processed/dataset/test"
     descript_path = "./processed/dataset/descript.csv"
-    train_path = "./processed/dataset/train/train.csv"
-    test_path = "./processed/dataset/test/test.csv"
-
+    train_path = "./processed/dataset/train/train.txt"
+    test_path = "./processed/dataset/test/test.txt"
 
     if not os.path.exists(dataset_dir):
         os.makedirs(dataset_dir)
@@ -209,17 +207,17 @@ def __split_train_test__(processed_fastas_directory, proportion_train):
     with open(descript_path, "w") as fd:
         fd.write("id,type\n")
         
-    with open(train_path, "w") as ft:
-        ft.write("id,fasta\n")
+    with open(train_path, "w"):
+        pass
 
-    with open(test_path, "w") as ft:
-        ft.write("id,fasta\n")
+    with open(test_path, "w"):
+        pass
 
     for root, _, files in os.walk(processed_fastas_directory):
         for file in files:
             with gzip.open(f"{root}/{file}", "rt") as fr:
                 fr.readline()
-                shuffled = fr.readlines()
+                shuffled = fr.readlines()[:-1]
             
             # Shuffles the data before splitting it
             np.random.shuffle(shuffled)
@@ -228,15 +226,37 @@ def __split_train_test__(processed_fastas_directory, proportion_train):
                 # Generates train set
                 with open(train_path, "a") as fwt:
                     for i in range(int(proportion_train*len(shuffled))):
-                        id = shuffled[i].split(",")[0]
-                        fwt.write(shuffled[i])
-                        fwd.write(f"{id},{file}\n")
+                        splt = shuffled[i].split(",")
+                        fwt.write(splt[1])
+                        fwd.write(f"{splt[0]},{file}\n")
                 # Generates test set
                 with open(test_path, "a") as fwt:
                     for i in range(int(proportion_train*len(shuffled)), len(shuffled)):
-                        id = shuffled[i].split(",")[0]
-                        fwt.write(shuffled[i])
-                        fwd.write(f"{id},{file}\n")
-            
-def create_finetuning_files():
-    raise NotImplementedError
+                        splt = shuffled[i].split(",")
+                        fwt.write(splt[1])
+                        fwd.write(f"{splt[0]},{file}\n")
+                        
+def create_finetuning_files(interactions_path):
+    """
+        Processes the raw interactions. It saves a new file for each target category and a file containing each category
+        at once. Each row will be the target's sequence, the SMILES of the drug and the pKd.
+        Files are saved as CSVs.
+        The ``Category`` column is added to the file containing all categories to allow for stratification during cross-validation.
+
+        Parameters:
+            interactions_path (str): path of the RAW interactions, saved in excel format.
+    """
+    excel = pd.read_excel(interactions_path)    
+    
+    if not os.path.exists("./processed/interactions"):
+        os.makedirs("./processed/interactions")
+
+    col_names = ["Target_RNA_sequence", "SMILES", "pKd"]
+    for cat in excel.groupby("Category"):
+        interactions = cat[1][col_names]
+        interactions.to_csv(f"./processed/interactions/{cat[0]}", index = False)
+
+    excel[col_names+["Category"]].to_csv("./processed/interactions/all.csv", index = False)
+
+#create_finetuning_files("./raw/interactions/smilies_xlsx.xlsx")
+__split_train_test__("./processed/fastas", proportion_train=0.9)
