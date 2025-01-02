@@ -61,7 +61,7 @@ def __save_to_csv__(sorted_mapping, write):
 def __save_fasta_database__(sorted_mapping, write):
     """
     Saves a FASTA file containing sequences to be used for the creation of a BLAST database. You probably shouldn't call this method on its own.
-    This method also deletes duplicate sequences. Called internally by prepare_blast_database().
+    This method also deletes duplicate sequences. Called internally by ``prepare_blast_database()``.
 
         Parameters:
             sorted_mapping (list of tuple): A list of tuples where each tuple contains an id and its corresponding sequence.
@@ -259,4 +259,4 @@ def create_finetuning_files(interactions_path):
     excel[col_names+["Category"]].to_csv("./processed/interactions/all.csv", index = False)
 
 #create_finetuning_files("./raw/interactions/smilies_xlsx.xlsx")
-__split_train_test__("./processed/fastas", proportion_train=0.9)
+#__split_train_test__("./processed/fastas", proportion_train=0.9)

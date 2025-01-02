@@ -2,9 +2,30 @@ import torch
 import torch.nn as nn
 import pandas as pd
 import numpy as np
+import pickle
 from torch.utils.data import Dataset
+from transformers import PretrainedConfig, PreTrainedModel
+from dataclasses import dataclass, field
 
 # The key is the drug because it binds to the target (like the key of a lock)
+class InteractionModelATTNConfig(PretrainedConfig):
+    def __init__(self, dropout = 0.2, num_heads = 1, **kwargs,):
+        self.num_heads = num_heads
+        self.dropout = dropout
+        super().__init__(**kwargs)
+
+class InteractionModelATTNForRegression(PreTrainedModel):
+    config_class = InteractionModelATTNConfig
+
+    def __init__(self, config, target_encoder, drug_encoder):
+        super().__init__(config)
+        self.model = InteractionModelATTN(target_encoder, 
+                                          drug_encoder, 
+                                          config.dropout, 
+                                          config.num_heads)
+
+    def forward(self, x1, x2):
+        return self.model(x1, x2)
 
 class InteractionModelATTN(nn.Module):
     def __init__(self, target_encoder, drug_encoder, dropout, num_heads=1):
@@ -42,7 +63,6 @@ class InteractionModelATTN(nn.Module):
 
         return out
 
-
 class InterDataset(Dataset):
     def __init__(self, targets, smiles, pkd=None):
         self.targets = targets
@@ -57,8 +77,7 @@ class InterDataset(Dataset):
             idx = idx.tolist()
 
         input1, input2 = self.targets[idx], self.smiles[idx]
-        #input1["input_ids"] = input1["input_ids"].view(-1)
-        #input2["input_ids"] = input2["input_ids"].view(-1)
+
         input1 = {"input_ids":self.targets["input_ids"][idx], "attention_mask": self.targets["attention_mask"][idx]}
         input2 = {"input_ids":self.smiles["input_ids"][idx], "attention_mask": self.smiles["attention_mask"][idx]}
         
@@ -67,4 +86,44 @@ class InterDataset(Dataset):
             target = self.pkd[idx]
 
         return ((input1, input2), target)
+
+    def save(self, directory):
+        with open(directory+'dataset.pkl', 'wb') as f:
+            pickle.dump(self, f)
+
+    def load(directory):
+        with open(directory+'dataset.pkl', 'rb') as f:
+            return pickle.load(f)
+
+class StdScaler():
+    def fit(self, X):
+        self.mean_ = torch.mean(X).item()
+        self.std_ = torch.std(X, correction=0).item()
+
+    def fit_transform(self, X):
+        self.mean_ = torch.mean(X).item()
+        self.std_ = torch.std(X, correction=0).item()
+
+        return (X-self.mean_)/self.std_
+    
+    def transform(self, X):
+        return (X-self.mean_)/self.std_
+
+    def inverse_transform(self, X):
+        return (X*self.std_)+self.mean_
+    
+    def save(self, directory):
+        with open(directory+"/scaler.config", "w") as f:
+            f.write(str(self.mean_)+"\n")
+            f.write(str(self.std_)+"\n")
+
+    def load(self, directory):
+        with open(directory+"/scaler.config", "r") as f:
+            self.mean_ = float(f.readline())
+            self.std_ = float(f.readline())
+
+@dataclass
+class ModelArgs:
+    attention_window: int = field(default=512, metadata={"help": "Size of attention window"})
+    max_pos: int = field(default=4096, metadata={"help": "Maximum position"})
 

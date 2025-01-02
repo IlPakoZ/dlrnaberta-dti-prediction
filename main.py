@@ -2,22 +2,23 @@ import train
 import pandas as pd
 import model 
 from transformers import AutoTokenizer, RobertaTokenizerFast
-import numpy as np
-from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import StratifiedKFold
-import matplotlib.pyplot as plt
+from sklearn.model_selection import train_test_split
+from datetime import datetime
+from datasets import load_dataset
+from transformers import TrainingArguments, HfArgumentParser
+from model import ModelArgs
 
 if __name__ == "__main__":
-    # Next thing to do: 
-    # StratifiedShuffleSplit (stratify by category)
+
     # During the final training, only then select sets such as sequences in training and validation sets don't overlap
     train_parameters = {"train_batch_size": 4,
                         "device": "cuda",
                         "learning_rate": 3e-4,
                         "adam_epsilon": 1e-6,
                         "gradient_accumulation_steps": 16,
+                        "layers_to_remove":6,
                         #"num_training_steps":3000,
-                        "num_epochs":4,
+                        "num_epochs":1,
                         "log_performance_every":5,
                         "weight_decay": 0.01,
                         "model_dropout": 0.2,
@@ -32,74 +33,60 @@ if __name__ == "__main__":
     drug_tokenizer = AutoTokenizer.from_pretrained("seyonec/PubChem10M_SMILES_BPE_450k")
     target_tokenizer = RobertaTokenizerFast.from_pretrained('./tokenizer')
 
-    accelerator, finetune_model, target_tokenizer, drug_tokenizer = train.create_model(train_parameters,  6)
+    parser = HfArgumentParser((TrainingArguments, ModelArgs,))
+    training_args, model_args = parser.parse_args_into_dataclasses(look_for_args_file=False, args=[
+        '--output_dir', 'tmp',
+        '--learning_rate', '2e-4',
+        '--weight_decay', '0.01',
+        '--adam_epsilon', '1e-6',
+        '--max_steps', '5000',
+        '--logging_steps', '100',
+        '--save_steps', '500',
+        '--max_grad_norm', '5.0',
+        '--per_device_eval_batch_size', '8',
+        '--per_device_train_batch_size', '2',
+        '--gradient_accumulation_steps', '32',
+        '--do_train',
+        '--do_eval',
+        #'--num_train_epochs', '1',
+        #'--tpu_num_cores', '8',                      # Number of TPU cores (typically 8)
+        '--lr_scheduler_type', 'cosine',
+        '--warmup_ratio', '0.1',
+        # This cosine scheduler drops to min lr rate of zero, not of 10x less the initial lr like in the paper
 
+        # This drops approximately 10x  
+        '--lr_scheduler_kwargs', '{"num_cycles": 0.41}',            
+    ])
+
+    training_args.train_datapath = './processed/dataset/train/train.txt'
+    training_args.test_datapath = './processed/dataset/test/test.txt'
+
+    training_args.prediction_loss_only = True
+    print("Device:", training_args.device)
+
+    target_encoder = train.load_RNABERTa(train_parameters["layers_to_remove"])
+
+    train.pretrain_and_evaluate(training_args, target_encoder, target_tokenizer, True, None)
+    
     # Try with smaller models
     inters = pd.read_csv("processed/interactions/all.csv")
     X = inters[["SMILES", "Target_RNA_sequence"]]
     y = inters['pKd'].values
     classes = inters["Category"].values
-
-    skf = StratifiedKFold(n_splits=8)
-    for i, (train_index, val_index) in enumerate(skf.split(X, classes)):
-        print(f"Fold {i}:")
-        train_X = inters.iloc[train_index]
-        val_X = inters.iloc[val_index]
-        train_y = y[train_index]
-        val_y = y[val_index]
-
-        smiles = drug_tokenizer(train_X["SMILES"].tolist(),
-                                padding="max_length", 
-                                truncation=True, 
-                                max_length=512,
-                                return_tensors="pt")
-        targets = target_tokenizer(train_X["Target_RNA_sequence"].tolist(),
-                                padding="max_length", 
-                                truncation=True, 
-                                max_length=512,
-                                return_tensors="pt")
-        
-        scaler = StandardScaler()
-
-        train_pkd = scaler.fit_transform(train_y.reshape(-1,1)).astype(np.float32)
-        train_dataset = model.InterDataset(targets, smiles, train_pkd)
-
-        smiles = drug_tokenizer(val_X["SMILES"].tolist(),
-                                padding="max_length", 
-                                truncation=True, 
-                                max_length=512,
-                                return_tensors="pt")
     
-        targets = target_tokenizer(val_X["Target_RNA_sequence"].tolist(),
-                                padding="max_length", 
-                                truncation=True, 
-                                max_length=512,
-                                return_tensors="pt")
+    scaler = model.StdScaler()
+    #result = train.crossvalidate(X, y, 3, train_parameters, scaler, classes)
+    #print(result)
+    #finetune_model, accelerator, train_dataset, val_dataset, scaler = train.load_finetuned_model("lora_adapter/20250102_155624")
 
-        val_pkd = scaler.transform(val_y.reshape(-1,1)).astype(np.float32)
-        val_dataset = model.InterDataset(targets, smiles, val_pkd)
-
-        print(len(val_dataset))
-
-        # Define a common x-axis range based on your data
-        common_range = (-4, 4)
-
-        # Plotting overlapping histograms with proportions
-        plt.figure(figsize=(8, 6))
-        plt.hist(train_pkd, bins=30, range=common_range, color='blue', alpha=0.5, edgecolor='black', label='train_pkd', density=True)
-        plt.hist(val_pkd, bins=30, range=common_range, color='red', alpha=0.5, edgecolor='black', label='val_pkd', density=True)
-
-        # Adding titles and labels
-        plt.title('Overlapping Distributions of train_pkd and val_pkd')
-        plt.xlabel('Scaled Values')
-        plt.ylabel('Proportion')
-        plt.legend()
-        plt.grid(axis='y', linestyle='--', alpha=0.7)
-
-        plt.show()
+    #train_X, val_X, train_y, val_y = train_test_split(X, y, train_size=0.875, stratify=classes, random_state=42)
+    #train_dataset, val_dataset = train.__prepare_train_val_datasets__(drug_tokenizer, target_tokenizer, train_X, val_X, train_y, val_y, scaler, plot=True)
+    #accelerator, finetune_model = train.create_finetune_model(train_parameters)
+    #scores, finetune_model = train.finetune_and_evaluate(finetune_model, accelerator, train_parameters, train_dataset, val_dataset, scaler)
+    #train.save_finetuned_model(finetune_model, train_parameters, train_dataset, val_dataset, scaler)
+    #best_params = train.optimize(X, y, 10, scaler, classes, True)
 
 
-        # Scaler should be passed to the methods and used to rescale the values back to normal during metric calculation
-        # Sklearn scaler is not compatible with cuda, implement it by yourself
-        # TODO: Implement the scalar
-        train.finetune_and_evaluate(finetune_model, accelerator, train_parameters, train_dataset, val_dataset, None)
+    #accelerator, finetune_model = train.create_finetune_model(train_parameters)
+    #scores, finetune_model = train.finetune_and_evaluate(finetune_model, accelerator, train_parameters, train_dataset, val_dataset, scaler)
+

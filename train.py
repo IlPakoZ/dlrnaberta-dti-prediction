@@ -1,37 +1,43 @@
 from tokenizers.implementations import CharBPETokenizer
 from tokenizers.processors import BertProcessing
 from torchmetrics.regression import R2Score, MeanAbsoluteError
-import matplotlib.pyplot as plt
-
-import torch
-import threading
-import copy
-import model as md
-import torch.nn as nn
-from transformers import AutoModelForMaskedLM, RobertaForMaskedLM, AutoTokenizer, RobertaTokenizerFast
+from datetime import datetime
+from transformers import AutoModelForMaskedLM, RobertaForMaskedLM, AutoTokenizer, RobertaTokenizerFast, DataCollatorForLanguageModeling
 from torch.utils.data import DataLoader
 from torch.optim import AdamW
 from accelerate import Accelerator, DeepSpeedPlugin
 from peft import LoraConfig, TaskType, get_peft_model, LoftQConfig
+from sklearn.model_selection import StratifiedKFold
+from transformers import Trainer, TrainingArguments
+from datasets import load_dataset
+
+import matplotlib.pyplot as plt
+import torch.nn as nn
+import model as md
+import numpy as np
+import torch
+import threading
+import copy
 import optuna
 import os
-from datetime import datetime
-
+import pickle
+import math
 
 PLOT_DIR = "plots"
 
 def train_tokenizer(train_files):
-    """Trains a RoBERTa tokenizer from the files ``train_files``.
-    Uses a character tokenizer for interpretability of tokens.
-    
-    Parameters:
-        train_files (list str): a list of paths from which to train the tokenizer.
+    """
+        Trains a RoBERTa tokenizer from the files ``train_files``.
+        Uses a character tokenizer for interpretability of tokens.
+        
+        Parameters:
+            train_files (list str): a list of paths from which to train the tokenizer.
     """
 
     roberta_base_tokenizer = CharBPETokenizer()
 
     # Customize training (change vocab size)
-    roberta_base_tokenizer.train(train_files, vocab_size=1000, min_frequency=2, special_tokens=[
+    roberta_base_tokenizer.train(train_files, vocab_size=2048, min_frequency=2, special_tokens=[
         "<s>",
         "<pad>",
         "</s>",
@@ -56,16 +62,16 @@ def __print_if_debug__(to_print, train_parameters):
 
 def __in_train_evaluate_model__(cpu_model, data_loader, train_parameters, state, scaler, thread_id):
     """
-    Evaluates the model on the validation data. 
-    Evaluation is done on CPU, so that the training can keep going in the meanwhile.    
+        Evaluates the model on the validation data. 
+        Evaluation is done on CPU, so that the training can keep going in the meanwhile.    
 
-    Parameters:
-        cpu_model: the model to be evaluated
-        data_loader (torch DataLoader): data loader containing the validation data
-        train_parameters (dict str -> obj): training parameters
-        state (dict str -> float): state of the training process, used to memorize metrics and other important state variables
-        scaler: Scaler used to scale targets, will be used to scale them back to normal during metric calculation
-        thread_id (str): name of the thread
+        Parameters:
+            cpu_model: the model to be evaluated
+            data_loader (torch DataLoader): data loader containing the validation data
+            train_parameters (dict str -> obj): training parameters
+            state (dict str -> float): state of the training process, used to memorize metrics and other important state variables
+            scaler: Scaler used to scale targets, will be used to scale them back to normal during metric calculation
+            thread_id (str): name of the thread
     """
     cpu_model.eval() 
 
@@ -106,8 +112,8 @@ def __check_mae_score_exit__(train_parameters, counter, train=True):
         Parameters:
             train_parameters (dict str -> obj): training parameters
             counter (int): number of consecutive logging steps in which loss hasn't decreased
-            train (bool): whether we are checking the train mae. If false, validation mae is checked instead.
-                Default: True
+            train (bool): whether we are checking the train mae. If ``False``, validation mae is checked instead.
+                Default: ``True``
     """
     if train:
         check = "exit_if_train_mae_converges"
@@ -123,10 +129,10 @@ def __check_mae_score_exit__(train_parameters, counter, train=True):
 # https://huggingface.co/docs/peft/main/en/task_guides/semantic_segmentation_lora
 def print_trainable_parameters(name, model):
     """
-    Prints the number of trainable parameters in the model.
-    
-    Parameters:
-        model: pytorch model
+        Prints the number of trainable parameters in the model.
+        
+        Parameters:
+            model: pytorch model
     """
     trainable_params = 0
     all_param = 0
@@ -141,7 +147,7 @@ def print_trainable_parameters(name, model):
 
 def __update_exit_conditions__(mean_loss, train_parameters, state):
     """
-        Checks the additional exit conditions. Returns True if the training process is finished.
+        Checks the additional exit conditions. Returns ``True`` if the training process is finished.
         Parameters:
             mean_loss (float): mean training loss.
             train_parameters (dict str -> obj): training parameters
@@ -166,6 +172,7 @@ def __update_exit_conditions__(mean_loss, train_parameters, state):
     to_exit = to_exit or __check_mae_score_exit__(train_parameters, state["counter_valid"], True) or __check_mae_score_exit__(train_parameters, state["counter_valid"], False)
 
     return to_exit
+
 def __unscale__(target_value, scaler=None):
     """
         Unscales the labels using a scaler. If the scaler is not specified, don't do anything.
@@ -174,8 +181,50 @@ def __unscale__(target_value, scaler=None):
         return target_value
     return scaler.inverse_transform(target_value)
 
+def tokenize_function(tokenizer, examples):
+    return tokenizer(examples["text"], padding="max_length", truncation=True, max_length=512, return_tensors="pt")
 
+def pretrain_and_evaluate(args, model, tokenizer, eval_only, checkpoint_path):
+    """
+        Pretrains and evaluates the RNA model. Pretraining consists of a Masked Language Modeling task.
 
+        Parameters:
+            args (DataClass): contains training parameters for the huggingface Trainer.
+            model: model to be pretrained
+            tokenizer: tokenizer of the model
+            eval_only: whether to only evaluate the performance of the model and not train it.
+            checkpoint_path: resume pretraining, starting from checkpoint in checkpoint_path.
+    """
+    data_files = {"val": args.test_datapath}
+    
+    if eval_only:
+        data_files["train"] = data_files["val"]
+    else:
+        print(f'Loading and tokenizing training data is usually slow: {args.train_datapath}')
+        data_files["train"] = args.train_datapath
+
+    datasets = load_dataset("text", data_files=data_files)
+    datasets = datasets.map(lambda x: tokenize_function(tokenizer, x), batched=True)
+
+    data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=True, mlm_probability=0.15)
+    trainer = Trainer(model=model, args=args, data_collator=data_collator,
+                      train_dataset=datasets["train"], eval_dataset=datasets["val"],)
+        
+    print("I'm evaluating...")
+    eval_loss = trainer.evaluate()
+    eval_loss = eval_loss['eval_loss']
+    print(f"Initial eval bpc: {eval_loss/math.log(2)}")
+
+    output_dir = "./pretrained"
+    if not eval_only:
+        print("I'm training...")
+        trainer.train(resume_from_checkpoint=checkpoint_path)
+        trainer.save_model(output_dir=output_dir)
+
+        eval_loss = trainer.evaluate()
+        eval_loss = eval_loss['eval_loss']
+        print(f"Eval bpc after pretraining: {eval_loss/math.log(2)}")
+    
 def finetune_and_evaluate(model, accelerator, train_parameters, train_dataset, val_dataset, scaler=None):
     """
         Trains (and evaluates) the model.
@@ -315,7 +364,16 @@ def finetune_and_evaluate(model, accelerator, train_parameters, train_dataset, v
             epoch+=1
 
     __plot_metrics__(state)
-    return evaluate(model, val_dataset, scaler)
+    scores = evaluate(model, val_dataset, scaler)
+    model = model.cpu()
+    #model, optimizer = accelerator.free_memory(model, optimizer)
+    
+
+    del train_dataset
+    del val_dataset
+    torch.cuda.empty_cache()
+
+    return scores, model
 
 def __plot_metrics__(state):
     """
@@ -348,9 +406,199 @@ def __plot_metrics__(state):
 
     current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
     plt.savefig(f"{PLOT_DIR}/metricsplots_{current_time}.png")
-def crossvalidate_finetuning(model, dataset):
-    raise NotImplementedError
+
+def save_finetuned_model(finetune_model, train_parameters, train_dataset, val_dataset, scaler):
+    """
+        Saves the finetuned model, datasets and scaler to drive so that they can be easily loaded in any time.
+
+        Parameters:
+            finetune_model: huggingface finetuned model
+            train_parameters (dict str -> obj): training parameters
+            train_dataset (md.InterDataset): the train dataset used for finetuning.
+            val_dataset (md.InterDataset): the validation dataset used for finetuning.
+            scaler: scaler used for finetuning.
+    """
+    current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
+    save_folder = f"./lora_adapter/{current_time}"
+
+
+    finetune_model.save_pretrained(save_folder, save_adapter=True, save_config=True)    
+    with open(save_folder+'/train_parameters.pkl', 'wb') as f:
+        pickle.dump(train_parameters, f)
+    train_dataset.save(save_folder+"/train")
+    val_dataset.save(save_folder+"/val")
+    scaler.save(save_folder)
+
+def load_finetuned_model(directory):
+    """
+        Loads a finetuned model, datasets and scaler from drive.
+
+        Parameters:
+            directory (str): directory containing all saved files.
+        
+        Returns:
+            the finetuned model, an accelerator, the train_dataset, the val_dataset and the scaler used for the training of the model.
+    """
     
+    train_dataset = md.InterDataset.load(directory+"/train")
+    val_dataset = md.InterDataset.load(directory+"/val")
+    with open(directory+'/train_parameters.pkl', 'rb') as f:
+        train_parameters = pickle.load(f)
+    scaler = md.StdScaler()
+    scaler.load(directory)
+    accelerator, model = create_finetune_model(train_parameters, directory)
+    return model, accelerator, train_dataset, val_dataset, scaler
+
+def __prepare_train_val_datasets__(drug_tokenizer, target_tokenizer, train_X, val_X, train_y, val_y, scaler, plot=False):
+    """
+        Preprocesses the training and validation datasets and returns them as instances of model.InterDataset.
+        Tokenization of sequences and drugs and scaling of regression label is executed.
+
+        Parameters:
+            drug_tokenizer: tokenizer of drug structure model
+            target_tokenizer: tokenizer of target sequence model
+            train_X (pandas.DataFrame): dataframe containing training data used for prediction
+            val_X (pandas.DataFrame): dataframe containing validation data used for performance evaluation
+            train_y (List): list containing training labels to predict (dissociation constant)
+            val_y (List): list containing validation labels to evaluate model (dissociation constant)
+            plot (bool): if ``True``, plots an histogram of the training and validation data distribution, binned by label value
+                Default: ``False``
+
+        Returns:
+            A pair containing the processed training dataset and the validation dataset
+        
+    """
+    train_y = np.array(train_y)
+    val_y = np.array(val_y)
+
+    smiles = drug_tokenizer(train_X["SMILES"].tolist(),
+                                padding="max_length", 
+                                truncation=True, 
+                                max_length=512,
+                                return_tensors="pt")
+    targets = target_tokenizer(train_X["Target_RNA_sequence"].tolist(),
+                                padding="max_length", 
+                                truncation=True, 
+                                max_length=512,
+                                return_tensors="pt")
+        
+    train_pkd = torch.Tensor(train_y.reshape(-1,1))
+    if scaler:
+        train_pkd = scaler.fit_transform(train_pkd).type(torch.float32)
+
+    train_dataset = md.InterDataset(targets, smiles, train_pkd)
+
+    smiles = drug_tokenizer(val_X["SMILES"].tolist(),
+                                padding="max_length", 
+                                truncation=True, 
+                                max_length=512,
+                                return_tensors="pt")
+    
+    targets = target_tokenizer(val_X["Target_RNA_sequence"].tolist(),
+                                padding="max_length", 
+                                truncation=True, 
+                                max_length=512,
+                                return_tensors="pt")
+    
+    val_pkd =  torch.Tensor(val_y.reshape(-1,1))
+    if scaler:
+        val_pkd = scaler.transform(val_pkd).type(torch.float32)
+    val_dataset = md.InterDataset(targets, smiles, val_pkd)
+    
+    if plot:
+        # Define a common x-axis range based on your data
+        common_range = (-4, 4)
+
+        # Plotting overlapping histograms with proportions
+        plt.figure(figsize=(8, 6))
+        plt.hist(train_pkd, bins=30, range=common_range, color='blue', alpha=0.5, edgecolor='black', label='train_pkd', density=True)
+        plt.hist(val_pkd, bins=30, range=common_range, color='red', alpha=0.5, edgecolor='black', label='val_pkd', density=True)
+
+        # Adding titles and labels
+        plt.title('Overlapping Distributions of train_pkd and val_pkd')
+        plt.xlabel('Scaled Values')
+        plt.ylabel('Proportion')
+        plt.legend()
+        plt.grid(axis='y', linestyle='--', alpha=0.7)
+
+        plt.show()
+    
+    return train_dataset, val_dataset
+
+
+def crossvalidate(X, y, n_split, train_parameters, scaler, classes, short_mode=False):
+    """
+        Executes finetuning with crossvalidation.
+
+        Parameters:
+            X (pandas.DataFrame): dataframe containing data used for prediction
+            y (List): list containing labels to predict for each interaction (dissociation constant)
+            n_split (int): number of cross validation folds to split the data into
+            train_parameters (dict str -> obj): training parameters
+            scaler: scaler to apply on labels
+            classes (List): classes by which to stratify the folds
+            short_mode (bool): if True, crossvalidation is not complete, meaning that only three rounds of crossvalidation are applied.
+                Default: False
+        Returns:
+            The mean, the minimum and maximum validation scores of the runs, for each metric.
+    """
+    all_scores = dict()
+    i = 0
+    for train_dataset, val_dataset in get_crossvalidate_datasets(X, y, n_split, scaler, classes):
+        accelerator, finetune_model = create_finetune_model(train_parameters)
+        scores, finetune_model = finetune_and_evaluate(finetune_model, accelerator, train_parameters, train_dataset, val_dataset, scaler)
+        del accelerator
+        del finetune_model
+        for score in scores:
+            if not score[0] in all_scores:
+                all_scores[score[0]] = []
+
+            all_scores[score[0]].append(score[1])
+
+        i+=1
+        if short_mode:
+            if i >= 3:
+                break
+
+    result = dict()
+    for (metric, scores) in all_scores.items():
+        result[metric] = ((sum(scores)/len(scores)), min(scores), max(scores))
+
+    return result
+    
+    
+
+def get_crossvalidate_datasets(X, y, n_split, scaler, classes, plot=False):
+    """
+        Generate ``n_split`` crossvalidation datasets. If ``classes`` is not None, generated ``n_split`` folds stratified by classes.
+
+        Parameters:
+            X (pandas.DataFrame): dataframe containing data used for prediction
+            y (List): list containing labels to predict for each interaction (dissociation constant)
+            n_split (int): number of cross validation folds to split the data into
+            scaler: scaler to apply on labels
+            classes (List): classes by which to stratify the folds.
+            plot (bool): if ``True``, plots an histogram of the training and validation data distribution, binned by label value
+                Default: ``False``
+
+        Yields:
+            A pair of datasets obtained from the next crossvalidation split
+
+    """
+    skf = StratifiedKFold(n_splits=n_split, shuffle=True)
+    target_tokenizer, drug_tokenizer = __get_tokenizers__()
+    for i, (train_index, val_index) in enumerate(skf.split(X, classes)):
+        print(f"Fold {i+1}:")
+        train_X = X.iloc[train_index]
+        val_X = X.iloc[val_index]
+        train_y = y[train_index]
+        val_y = y[val_index]
+
+
+        train_dataset, val_dataset = __prepare_train_val_datasets__(drug_tokenizer, target_tokenizer, train_X, val_X, train_y, val_y, scaler, plot)
+
+        yield train_dataset, val_dataset
+
 def deleteEncodingLayers(model, num_layers_to_remove):  # must pass in the full bert model
     """
     Removes layers from a RoBERTa model to get a smaller model.
@@ -383,13 +631,16 @@ def evaluate(model, val_dataset, scaler, metrics = [R2Score(), MeanAbsoluteError
             model: the model to evaluate
             val_dataset (torch Dataset): Dataset containing validation examples
             scaler: Scaler used to scale targets, will be used to scale them back to normal during metric calculation
-
             metrics: a list of metrics the model will be evaluated against
-                Default: [R2Score(), MeanAbsoluteError()]
+                Default: ``[R2Score(), MeanAbsoluteError()]``
             device: device where the operations will be computed on
                 Default: "cuda"
+
+            Returns:
+                A list of pairs with metrics and their corresponding scores
     """
 
+    # TODO: Device is not implemented
     model = model.cpu()
     model.eval()
 
@@ -419,6 +670,7 @@ def evaluate(model, val_dataset, scaler, metrics = [R2Score(), MeanAbsoluteError
     sorted_targets = list(sorted_targets)
     sorted_outputs = list(sorted_outputs)
 
+    
     scores = []
     for metric in metrics:
         metric_score = metric.compute()
@@ -428,7 +680,7 @@ def evaluate(model, val_dataset, scaler, metrics = [R2Score(), MeanAbsoluteError
 
         print("####### EVALUATION METRICS ########")
         print(f"{metric_name}: {metric_score}")
-
+    
     plt.clf()  # Clears the current figure
     plt.plot(sorted_outputs, sorted_targets, 'o', label="Model Predictions")
     # Plot the red semi-transparent line
@@ -445,54 +697,73 @@ def evaluate(model, val_dataset, scaler, metrics = [R2Score(), MeanAbsoluteError
 
     fig = plt.gcf()  # Get the current figure
     current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
-
     fig.savefig(f"{PLOT_DIR}/calibration_{current_time}.png")
-
-    #plt.grid()
     
     return scores
 
+def __get_tokenizers__():
+    """
+        Returns the tokenizers of the target and drug encoders.
 
-def create_model(train_parameters, layers_to_remove=0):
+        Returns:
+            the tokenizers of the target and drug encoders.
+    """
+    target_tokenizer = RobertaTokenizerFast.from_pretrained('./tokenizer')
+    drug_tokenizer = AutoTokenizer.from_pretrained("seyonec/PubChem10M_SMILES_BPE_450k")
+
+    return target_tokenizer, drug_tokenizer
+
+def load_RNABERTa(layers_to_remove):
+    """
+        Returns the target encoder with the specified number of encoder blocks removed.
+
+        Returns:
+            the target encoder.
+    """
+    target_encoder = RobertaForMaskedLM.from_pretrained('roberta-base', output_hidden_states=True)
+    target_tokenizer, _ = __get_tokenizers__()
+    target_encoder.resize_token_embeddings(len(target_tokenizer))
+    target_encoder = deleteEncodingLayers(target_encoder, layers_to_remove)
+    return target_encoder    
+
+def create_finetune_model(train_parameters, from_pretrained=None):
     """
         Load the pretrained models and prepare them for finetuning.
         LoRA is prepared for finetuning and LoftQ is applied for the target encoder.
 
         Parameters:
             train_parameters (dict str -> obj): training parameters
-            layers_to_remove (int): number of layers to remove from the target encoder model.
+            from_pretrained (str): path of the pretrained model to load, if available. If not, create a new model. 
+                Default: None
+        Returns:
+            a transformers accelerator and the model to be trained.
 
     """
     torch.cuda.empty_cache()
 
     drug_encoder = AutoModelForMaskedLM.from_pretrained("seyonec/PubChem10M_SMILES_BPE_450k", output_hidden_states=True)
-    drug_tokenizer = AutoTokenizer.from_pretrained("seyonec/PubChem10M_SMILES_BPE_450k")
-
-    target_encoder = RobertaForMaskedLM.from_pretrained('roberta-base', output_hidden_states=True)
-    target_tokenizer = RobertaTokenizerFast.from_pretrained('./tokenizer')
-    target_encoder.resize_token_embeddings(len(target_tokenizer))
-    target_encoder = deleteEncodingLayers(target_encoder, layers_to_remove)
+    target_encoder = load_RNABERTa(train_parameters["layers_to_remove"])
 
     loftq_config = LoftQConfig(loftq_bits=8)           
     lora_config_target = LoraConfig(r=train_parameters["lora_r"],
-                            lora_alpha=train_parameters["lora_alpha"], 
-                            use_rslora=True, 
-                            bias="none",
-                            target_modules=["query", "key", "value", "dense"],
-                            init_lora_weights="loftq", 
-                            loftq_config=loftq_config,
-                            task_type=TaskType.FEATURE_EXTRACTION,
-                            lora_dropout=train_parameters["lora_dropout"])
+                                lora_alpha=train_parameters["lora_alpha"], 
+                                use_rslora=True, 
+                                bias="none",
+                                target_modules=["query", "key", "value", "dense"],
+                                init_lora_weights="loftq", 
+                                loftq_config=loftq_config,
+                                task_type=TaskType.FEATURE_EXTRACTION,
+                                lora_dropout=train_parameters["lora_dropout"])
     
     # Could add quantization for this too
     lora_config_drug = LoraConfig(r=train_parameters["lora_r"],
-                            lora_alpha=train_parameters["lora_alpha"], 
-                            use_rslora=True, 
-                            bias="none",
-                            target_modules=["query", "key", "value", "dense"],
-                            task_type=TaskType.FEATURE_EXTRACTION,
-                            lora_dropout=train_parameters["lora_dropout"])
-    
+                                lora_alpha=train_parameters["lora_alpha"], 
+                                use_rslora=True, 
+                                bias="none",
+                                target_modules=["query", "key", "value", "dense"],
+                                task_type=TaskType.FEATURE_EXTRACTION,
+                                lora_dropout=train_parameters["lora_dropout"])
+        
     target_encoder = get_peft_model(target_encoder, lora_config_target)
     drug_encoder = get_peft_model(drug_encoder, lora_config_drug)
 
@@ -500,19 +771,58 @@ def create_model(train_parameters, layers_to_remove=0):
 
     print_trainable_parameters("Target encoder:", target_encoder)
     print_trainable_parameters("Drug encoder:", drug_encoder)
-    model = md.InteractionModelATTN(target_encoder, drug_encoder, train_parameters["model_dropout"])
 
-    deepspeed_plugin = DeepSpeedPlugin(hf_ds_config="ds_config.json")
+    if not from_pretrained:
+        config = md.InteractionModelATTNConfig(train_parameters["model_dropout"])
+        model = md.InteractionModelATTNForRegression(config, target_encoder, drug_encoder)
+    else:
+        model = md.InteractionModelATTNForRegression.from_pretrained(from_pretrained, target_encoder, drug_encoder)
+
+    deepspeed_plugin = None
+    # This makes everything crash during cross_validation for some reason
+    # To reproduce, move deepspeed_plugin + accelerator lines before model loading
+    # Maybe conflict between LoftQ quantization and deepspeed moving everything to CPU
+    #deepspeed_plugin = DeepSpeedPlugin(hf_ds_config="ds_config.json")
     accelerator = Accelerator(deepspeed_plugin=deepspeed_plugin, gradient_accumulation_steps=train_parameters["gradient_accumulation_steps"], mixed_precision="bf16")
 
-    return accelerator, model, target_tokenizer, drug_tokenizer
+    return accelerator, model
 
-def optimize():
-    """
-    Not implemented
-    """
+def objective(trial, X, y, n_split, scaler, classes, short_mode):
 
-    raise NotImplementedError
+    train_parameters = {
+        "train_batch_size": 4,
+        "device": "cuda",
+        "gradient_accumulation_steps": trial.suggest_categorical("gradient_accumulation_steps", [4, 8, 16])}
+
+    gas = train_parameters["gradient_accumulation_steps"]
+
+    train_parameters.update({
+                        "learning_rate": trial.suggest_float("learning_rate", 2e-6, 2e-5, log=True)*np.sqrt(gas*train_parameters["train_batch_size"]),
+                        "adam_epsilon": 1e-6,
+                        "num_epochs":20,
+                        "log_performance_every":5,
+                        "weight_decay": trial.suggest_float("weight_decay", 1e-3, 1e-1, log=True),
+                        "model_dropout": trial.suggest_float("model_dropout", 0.1, 0.5),
+                        "lora_r": trial.suggest_categorical("lora_r", [4, 8, 16, 32]),
+                        "lora_alpha": trial.suggest_categorical("lora_alpha", [4, 8, 16, 32, 64]),
+                        "lora_dropout":trial.suggest_float("lora_dropout", 0, 0.5),
+                        "max_norm":1,
+                        })
+
+    results = crossvalidate(X, y, n_split, train_parameters, scaler, classes, short_mode)
+    return np.mean(results["R2Score"][:2])
+
+def optimize(X, y, n_split, scaler, classes, short_mode):
+    """
+        Use Optuna TPESampler to optimize finetuning parameters.
+        
+        Parameters:
+            X (pandas.DataFrame): dataframe containing data used for prediction
+            y (List): list containing labels to predict for each interaction (dissociation constant)
+            n_split (int): number of cross validation folds to split the data into
+            scaler: scaler to apply on labels
+            classes (List): classes by which to stratify the folds.
+    """
     study = optuna.create_study(
         direction="maximize",
         sampler=optuna.samplers.TPESampler(seed=14),
@@ -520,6 +830,6 @@ def optimize():
         load_if_exists=True
     )
 
-    
-    #study.optimize(objective, n_trials=10)
+    study.optimize(lambda trial: objective(trial, X, y, n_split, scaler, classes, short_mode), n_trials=20)
 
+    return study.best_params
