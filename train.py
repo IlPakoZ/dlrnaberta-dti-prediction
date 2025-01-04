@@ -2,7 +2,7 @@ from tokenizers.implementations import CharBPETokenizer
 from tokenizers.processors import BertProcessing
 from torchmetrics.regression import R2Score, MeanAbsoluteError
 from datetime import datetime
-from transformers import AutoModelForMaskedLM, RobertaForMaskedLM, AutoTokenizer, RobertaTokenizerFast, DataCollatorForLanguageModeling
+from transformers import AutoModelForMaskedLM, RobertaForMaskedLM, AutoTokenizer, RobertaTokenizerFast, DataCollatorForLanguageModeling, AutoModel, RobertaConfig
 from torch.utils.data import DataLoader
 from torch.optim import AdamW
 from accelerate import Accelerator, DeepSpeedPlugin
@@ -288,10 +288,8 @@ def finetune_and_evaluate(model, accelerator, train_parameters, train_dataset, v
                     optimizer.zero_grad()  # Reset gradients
 
                     output = model(train_source[0], train_source[1])
-                    
-                    loss = criterion(output, train_targets)
-                    
 
+                    loss = criterion(output, train_targets)
                     mean_loss+=loss.item()
                     accelerator.backward(loss)
 
@@ -360,7 +358,6 @@ def finetune_and_evaluate(model, accelerator, train_parameters, train_dataset, v
 
                     if step >= max_steps:
                         break
-                        
             epoch+=1
 
     __plot_metrics__(state)
@@ -419,7 +416,7 @@ def save_finetuned_model(finetune_model, train_parameters, train_dataset, val_da
             scaler: scaler used for finetuning.
     """
     current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
-    save_folder = f"./lora_adapter/{current_time}"
+    save_folder = f"./saves/{current_time}"
 
 
     finetune_model.save_pretrained(save_folder, save_adapter=True, save_config=True)    
@@ -511,8 +508,8 @@ def __prepare_train_val_datasets__(drug_tokenizer, target_tokenizer, train_X, va
 
         # Plotting overlapping histograms with proportions
         plt.figure(figsize=(8, 6))
-        plt.hist(train_pkd, bins=30, range=common_range, color='blue', alpha=0.5, edgecolor='black', label='train_pkd', density=True)
-        plt.hist(val_pkd, bins=30, range=common_range, color='red', alpha=0.5, edgecolor='black', label='val_pkd', density=True)
+        plt.hist(train_pkd.reshape(-1), bins=30, range=common_range, color='blue', alpha=0.5, edgecolor='black', label='train_pkd', density=True)
+        plt.hist(val_pkd.reshape(-1), bins=30, range=common_range, color='red', alpha=0.5, edgecolor='black', label='val_pkd', density=True)
 
         # Adding titles and labels
         plt.title('Overlapping Distributions of train_pkd and val_pkd')
@@ -709,7 +706,7 @@ def __get_tokenizers__():
             the tokenizers of the target and drug encoders.
     """
     target_tokenizer = RobertaTokenizerFast.from_pretrained('./tokenizer')
-    drug_tokenizer = AutoTokenizer.from_pretrained("seyonec/PubChem10M_SMILES_BPE_450k")
+    drug_tokenizer = AutoTokenizer.from_pretrained("DeepChem/ChemBERTa-77M-MTR")
 
     return target_tokenizer, drug_tokenizer
 
@@ -720,9 +717,17 @@ def load_RNABERTa(layers_to_remove):
         Returns:
             the target encoder.
     """
-    target_encoder = RobertaForMaskedLM.from_pretrained('roberta-base', output_hidden_states=True)
     target_tokenizer, _ = __get_tokenizers__()
-    target_encoder.resize_token_embeddings(len(target_tokenizer))
+    configuration = RobertaConfig(vocab_size=len(target_tokenizer),
+                                hidden_size=384,
+                                num_hidden_layers=12,  
+                                num_attention_heads=12,  
+                                intermediate_size=3072,
+                                max_position_embeddings=514,
+                                output_hidden_states=True)
+
+    target_encoder = RobertaForMaskedLM(configuration)
+
     target_encoder = deleteEncodingLayers(target_encoder, layers_to_remove)
     return target_encoder    
 
@@ -741,7 +746,7 @@ def create_finetune_model(train_parameters, from_pretrained=None):
     """
     torch.cuda.empty_cache()
 
-    drug_encoder = AutoModelForMaskedLM.from_pretrained("seyonec/PubChem10M_SMILES_BPE_450k", output_hidden_states=True)
+    drug_encoder = AutoModel.from_pretrained("DeepChem/ChemBERTa-77M-MTR", output_hidden_states=True)
     target_encoder = load_RNABERTa(train_parameters["layers_to_remove"])
 
     loftq_config = LoftQConfig(loftq_bits=8)           

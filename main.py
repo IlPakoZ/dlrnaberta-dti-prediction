@@ -1,12 +1,13 @@
 import train
 import pandas as pd
 import model 
-from transformers import AutoTokenizer, RobertaTokenizerFast
+from transformers import AutoTokenizer, RobertaTokenizerFast, AutoModel, RobertaForMaskedLM
 from sklearn.model_selection import train_test_split
 from datetime import datetime
 from datasets import load_dataset
 from transformers import TrainingArguments, HfArgumentParser
 from model import ModelArgs
+
 
 if __name__ == "__main__":
 
@@ -16,9 +17,9 @@ if __name__ == "__main__":
                         "learning_rate": 3e-4,
                         "adam_epsilon": 1e-6,
                         "gradient_accumulation_steps": 16,
-                        "layers_to_remove":6,
+                        "layers_to_remove":0,
                         #"num_training_steps":3000,
-                        "num_epochs":1,
+                        "num_epochs":10,
                         "log_performance_every":5,
                         "weight_decay": 0.01,
                         "model_dropout": 0.2,
@@ -29,10 +30,8 @@ if __name__ == "__main__":
                         #plot_grads":True,
                         "validate_while_training":True
                         }
-    
-    drug_tokenizer = AutoTokenizer.from_pretrained("seyonec/PubChem10M_SMILES_BPE_450k")
-    target_tokenizer = RobertaTokenizerFast.from_pretrained('./tokenizer')
 
+    """
     parser = HfArgumentParser((TrainingArguments, ModelArgs,))
     training_args, model_args = parser.parse_args_into_dataclasses(look_for_args_file=False, args=[
         '--output_dir', 'tmp',
@@ -63,11 +62,10 @@ if __name__ == "__main__":
 
     training_args.prediction_loss_only = True
     print("Device:", training_args.device)
-
     target_encoder = train.load_RNABERTa(train_parameters["layers_to_remove"])
 
     train.pretrain_and_evaluate(training_args, target_encoder, target_tokenizer, True, None)
-    
+    """
     # Try with smaller models
     inters = pd.read_csv("processed/interactions/all.csv")
     X = inters[["SMILES", "Target_RNA_sequence"]]
@@ -78,12 +76,12 @@ if __name__ == "__main__":
     #result = train.crossvalidate(X, y, 3, train_parameters, scaler, classes)
     #print(result)
     #finetune_model, accelerator, train_dataset, val_dataset, scaler = train.load_finetuned_model("lora_adapter/20250102_155624")
-
-    #train_X, val_X, train_y, val_y = train_test_split(X, y, train_size=0.875, stratify=classes, random_state=42)
-    #train_dataset, val_dataset = train.__prepare_train_val_datasets__(drug_tokenizer, target_tokenizer, train_X, val_X, train_y, val_y, scaler, plot=True)
-    #accelerator, finetune_model = train.create_finetune_model(train_parameters)
-    #scores, finetune_model = train.finetune_and_evaluate(finetune_model, accelerator, train_parameters, train_dataset, val_dataset, scaler)
-    #train.save_finetuned_model(finetune_model, train_parameters, train_dataset, val_dataset, scaler)
+    target_tokenizer, drug_tokenizer = train.__get_tokenizers__()
+    train_X, val_X, train_y, val_y = train_test_split(X, y, train_size=0.875, stratify=classes, random_state=42)
+    train_dataset, val_dataset = train.__prepare_train_val_datasets__(drug_tokenizer, target_tokenizer, train_X, val_X, train_y, val_y, scaler, plot=True)
+    accelerator, finetune_model = train.create_finetune_model(train_parameters)
+    scores, finetune_model = train.finetune_and_evaluate(finetune_model, accelerator, train_parameters, train_dataset, val_dataset, scaler)
+    train.save_finetuned_model(finetune_model, train_parameters, train_dataset, val_dataset, scaler)
     #best_params = train.optimize(X, y, 10, scaler, classes, True)
 
 

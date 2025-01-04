@@ -32,15 +32,15 @@ class InteractionModelATTN(nn.Module):
         super().__init__()
         self.target_encoder = target_encoder
         self.drug_encoder = drug_encoder
-        self.multihead_attention = nn.MultiheadAttention(768, num_heads, dropout = dropout, batch_first=True)
+        self.multihead_attention = nn.MultiheadAttention(384, num_heads, dropout = dropout, batch_first=True)
         self.conv = nn.Conv1d(in_channels=512, out_channels=1, kernel_size=1)
         self.dropout = nn.Dropout(dropout)
 
-        self.norm1 = nn.LayerNorm(768)                          # For attention output
+        self.norm1 = nn.LayerNorm(384)                          # For attention output
         self.gelu = nn.GELU()
         self.batch_norm = nn.BatchNorm1d(1)
-        self.process = nn.Linear(768, 768)
-        self.output = nn.Linear(768, 1)
+        self.process = nn.Linear(384, 384)
+        self.output = nn.Linear(384, 1)
 
         
     def forward(self, x1, x2):
@@ -50,6 +50,7 @@ class InteractionModelATTN(nn.Module):
         key_padding_mask = torch.squeeze(x2["attention_mask"], axis=1).bool() # This doesn't work in multihead_attention
         out, _ = self.multihead_attention(y1, y2, y1, key_padding_mask=torch.squeeze(x2["attention_mask"].float(), axis=1))
         out = self.norm1(self.dropout(out))
+
         out = out.masked_fill(key_padding_mask.unsqueeze(2), 0) # Padding elements values should contribute zero to the sum
         
         scales = key_padding_mask.sum(dim=-1).unsqueeze(1)      # Number of non-padded elements
