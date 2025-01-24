@@ -1,6 +1,6 @@
 from tokenizers.implementations import CharBPETokenizer
 from tokenizers.processors import BertProcessing
-from torchmetrics.regression import R2Score, MeanAbsoluteError
+from torchmetrics.regression import R2Score, MeanAbsoluteError, PearsonCorrCoef
 from datetime import datetime
 from transformers import AutoModelForMaskedLM, RobertaForMaskedLM, AutoTokenizer, RobertaTokenizerFast, DataCollatorForLanguageModeling, AutoModel, RobertaConfig
 from torch.utils.data import DataLoader
@@ -10,11 +10,13 @@ from peft import LoraConfig, TaskType, get_peft_model, LoftQConfig
 from sklearn.model_selection import StratifiedKFold
 from transformers import Trainer, TrainingArguments
 from datasets import load_dataset
+from sklearn.model_selection import train_test_split
 
 import matplotlib.pyplot as plt
 import torch.nn as nn
 import model as md
 import numpy as np
+import pandas as pd
 import torch
 import threading
 import copy
@@ -77,13 +79,14 @@ def __in_train_evaluate_model__(cpu_model, data_loader, train_parameters, state,
 
     r2_metric = R2Score()
     mae_metric = MeanAbsoluteError()
-    
+    pearson_r_metric = PearsonCorrCoef()
     eval_n = 0
 
     with torch.no_grad():
         for source, targets in data_loader:
-            if eval_n > (train_parameters["gradient_accumulation_steps"]*train_parameters["log_performance_every"])//3:
-                break
+            if not "val_all" in train_parameters:
+                if eval_n > (train_parameters["gradient_accumulation_steps"]*train_parameters["log_performance_every"])//3:
+                    break
             targets = targets.reshape(-1, 1)
             output = cpu_model(source[0], source[1])
             
@@ -92,6 +95,7 @@ def __in_train_evaluate_model__(cpu_model, data_loader, train_parameters, state,
 
             r2_metric.update(output, targets)
             mae_metric.update(output, targets)
+            pearson_r_metric.update(output, targets)
 
             eval_n += 1
 
@@ -99,9 +103,17 @@ def __in_train_evaluate_model__(cpu_model, data_loader, train_parameters, state,
     state["last_valid_mae_score"] = state["valid_mae_score"]
     state["valid_r2_score"] = r2_metric.compute()
     state["valid_mae_score"] = mae_metric.compute()
+    state["valid_pearson_r_score"] = pearson_r_metric.compute()
+    if state["valid_r2_score"] > state["best_r2"]: 
+        state["best_r2"] = state["valid_r2_score"]
+        state["best_mae_score"] = state["valid_mae_score"]
+        state["best_model"] = cpu_model
+
     state["val_maes"].append(state["valid_mae_score"])
     state["val_r2s"].append(state["valid_r2_score"])
-    print(f"Step {thread_id} - R2 val: {state['valid_r2_score']:.4f}, MAE val: {state['valid_mae_score']:.4f}")
+    state["val_pears"].append(state["valid_pearson_r_score"])
+
+    print(f"Step {thread_id} - R2 val: {state['valid_r2_score']:.4f}, MAE val: {state['valid_mae_score']:.4f}, Pearson R val: {state['valid_pearson_r_score']:.4f}")
       
 
 def __check_mae_score_exit__(train_parameters, counter, train=True):
@@ -225,6 +237,51 @@ def pretrain_and_evaluate(args, model, tokenizer, eval_only, checkpoint_path):
         eval_loss = eval_loss['eval_loss']
         print(f"Eval bpc after pretraining: {eval_loss/math.log(2)}")
     
+def split(inters, X, y, train_size, random_state):
+    """
+    Splits the interaction datasets into training and validation sets while ensuring that 
+    each class has at least two samples. Removes classes with only one sample and adds 
+    them back to the training set after the split.
+    Parameters:
+        inters (pd.DataFrame): DataFrame containing interaction data with a "Category" column 
+                            and a "pKd" column.
+        X (pd.DataFrame): Dataframe containing features.
+        y (np.ndarray): Array containing targets.
+        train_size (float): Proportion of the dataset to include in the training set.
+        random_state (int): Random seed for reproducibility.
+    Returns:
+    tuple: A tuple containing the training and validation feature matrices (train_X, val_X) 
+           and the training and validation target vectors (train_y, val_y).
+    """
+    classes = list(zip(inters["Category"].values, (inters["pKd"]+0.5).astype(int)))    
+    
+    vals = dict()
+    for i in range(len(classes)):
+        c = classes[i]
+        if not c in vals:
+            vals[c] = []
+        vals[c].append(i)
+
+    to_remove = []
+    for k,v in vals.items():
+        if len(v) == 1:
+            to_remove.append(v[0])
+
+    X_res = X.loc[to_remove]
+    y_res = y[to_remove]
+
+    X = X.drop(to_remove)
+    y = np.delete(y, to_remove)
+
+    for index in to_remove[::-1]:
+        classes.pop(index)
+
+    train_X, val_X, train_y, val_y = train_test_split(X, y, train_size=train_size, stratify=classes, random_state=random_state)
+    train_X = pd.concat((train_X, X_res))
+    train_y = np.concatenate((train_y, y_res))
+    return train_X, val_X, train_y, val_y
+
+    
 def finetune_and_evaluate(model, accelerator, train_parameters, train_dataset, val_dataset, scaler=None):
     """
         Trains (and evaluates) the model.
@@ -245,8 +302,9 @@ def finetune_and_evaluate(model, accelerator, train_parameters, train_dataset, v
     
     r2_train = R2Score().to(device)
     mae_train = MeanAbsoluteError().to(device)
-
-    state = {"valid_mae_score":0, "train_mae_score":0, "train_r2_score":0, "valid_r2_score":0, "counter_train":0, "counter_valid":0, "last_train_mae_score":0, "last_valid_mae_score":0, "val_maes":[], "val_r2s":[]}
+    pearson_r_train = PearsonCorrCoef().to(device)
+    
+    state = {"valid_mae_score":0, "train_mae_score":0, "train_r2_score":0, "train_pearson_r_score":0, "valid_r2_score":0, "valid_pearson_r_score": 0, "counter_train":0, "counter_valid":0, "last_train_mae_score":0, "last_valid_mae_score":0, "best_r2":-100, "val_maes":[], "val_r2s":[], "val_pears":[]}
 
     optimizer = AdamW(model.parameters(), lr=train_parameters["learning_rate"], weight_decay=train_parameters["weight_decay"])
     train_loader = DataLoader(train_dataset, batch_size=train_parameters["train_batch_size"], shuffle=True)
@@ -281,6 +339,7 @@ def finetune_and_evaluate(model, accelerator, train_parameters, train_dataset, v
 
     while step < max_steps and not to_exit:
             print(f"EPOCH {epoch}:")
+            done = False
             for train_source, train_targets in train_loader:
                 train_targets = train_targets.reshape(-1, 1)
                 
@@ -314,6 +373,7 @@ def finetune_and_evaluate(model, accelerator, train_parameters, train_dataset, v
                             
                     r2_train.update(output, train_targets)
                     mae_train.update(output, train_targets)
+                    pearson_r_train.update(output, train_targets)
 
                     optimizer.step()
 
@@ -321,10 +381,9 @@ def finetune_and_evaluate(model, accelerator, train_parameters, train_dataset, v
                     # Note that the ``step`` variable indicates each iteration in the training loop, while for logging steps
                     # only steps which update the gradients are considered
                     if (step + 1) % (train_parameters["log_performance_every"]*train_parameters["gradient_accumulation_steps"]) == 0:
-
                         # Compute metrics for validation set if "validate_while_training" setting is enabled
-                        if "validate_while_training" in train_parameters and train_parameters["validate_while_training"]:
-                            
+                        if ("validate_while_training" in train_parameters and train_parameters["validate_while_training"] and not "val_all" in train_parameters) or ("val_all" in train_parameters and not done):
+                            done = True
                             cpu_model = copy.deepcopy(model).cpu()
                             output = cpu_model(source1[0], source1[1])
                             print(output.detach(), targets1.detach())
@@ -333,16 +392,18 @@ def finetune_and_evaluate(model, accelerator, train_parameters, train_dataset, v
                                 args=(cpu_model, val_loader, train_parameters, state, scaler, step+1)
                             )
                             eval_thread.start()
-
+                        
                         state["last_train_mae_score"] = state["train_mae_score"]
                         state["train_r2_score"] = r2_train.compute()
                         state["train_mae_score"] = mae_train.compute()
+                        state["train_pearson_r_score"] = pearson_r_train.compute()
                         mae_train.reset()
                         r2_train.reset()
-                        
+                        pearson_r_train.reset()
+
                         # check whether division by gradient_steps is necessary or done automatically
                         mean_loss /= (train_parameters["log_performance_every"]*train_parameters["gradient_accumulation_steps"])
-                        print(f"Step {step + 1} - Loss: {mean_loss:.4f}, R2: {state['train_r2_score']:.4f}, MAE: {state['train_mae_score']:.4f}")
+                        print(f"Step {step + 1} - Loss: {mean_loss:.4f}, R2: {state['train_r2_score']:.4f}, MAE: {state['train_mae_score']:.4f}, Pearson R: {state['train_pearson_r_score']:.4f}")
                         
                         if "plot_grads" in train_parameters and train_parameters["plot_grads"]:
                             plt.yscale("log")
@@ -365,6 +426,11 @@ def finetune_and_evaluate(model, accelerator, train_parameters, train_dataset, v
     model = model.cpu()
     #model, optimizer = accelerator.free_memory(model, optimizer)
     
+    # Evaluate best model
+    print("Best R^2 recoded:", state["best_r2"])
+    best_scores = evaluate(state["best_model"], val_dataset, scaler)
+    save_finetuned_model(state["best_model"], train_parameters, train_dataset, val_dataset, scaler, suffix="_best")
+    
 
     del train_dataset
     del val_dataset
@@ -379,7 +445,7 @@ def __plot_metrics__(state):
     Parameters:
         state (dict str -> float): state of the training process, used to memorize metrics and other important state variables
     """
-    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
 
     # Plot validation MAE
     axes[0].plot(state["val_maes"], label="Validation MAE")
@@ -395,6 +461,12 @@ def __plot_metrics__(state):
     axes[1].set_ylabel("R² Score")
     axes[1].legend()
 
+    # Plot validation Pearson Coefficient
+    axes[2].plot(state["val_pears"], label="Validation Pearson R Score", color="darkgreen")
+    axes[2].set_title("Validation Pearson R Scores")
+    axes[2].set_xlabel("Epochs")
+    axes[2].set_ylabel("Pearson R Score")
+    axes[2].legend()
     # Adjust layout
     plt.tight_layout()
 
@@ -404,7 +476,7 @@ def __plot_metrics__(state):
     current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
     plt.savefig(f"{PLOT_DIR}/metricsplots_{current_time}.png")
 
-def save_finetuned_model(finetune_model, train_parameters, train_dataset, val_dataset, scaler):
+def save_finetuned_model(finetune_model, train_parameters, train_dataset, val_dataset, scaler, suffix=""):
     """
         Saves the finetuned model, datasets and scaler to drive so that they can be easily loaded in any time.
 
@@ -416,7 +488,7 @@ def save_finetuned_model(finetune_model, train_parameters, train_dataset, val_da
             scaler: scaler used for finetuning.
     """
     current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
-    save_folder = f"./saves/{current_time}"
+    save_folder = f"./saves/{current_time}{suffix}"
 
 
     finetune_model.save_pretrained(save_folder, save_adapter=True, save_config=True)    
@@ -620,7 +692,7 @@ def deleteEncodingLayers(model, num_layers_to_remove):  # must pass in the full 
 
     return copyOfModel
     
-def evaluate(model, val_dataset, scaler, metrics = [R2Score(), MeanAbsoluteError()], device = "cuda"):
+def evaluate(model, val_dataset, scaler, metrics = [R2Score(), MeanAbsoluteError(), PearsonCorrCoef()], device = "cuda"):
     """
         Evaluates the model against a list of metric ``metrics``.
 
@@ -629,7 +701,7 @@ def evaluate(model, val_dataset, scaler, metrics = [R2Score(), MeanAbsoluteError
             val_dataset (torch Dataset): Dataset containing validation examples
             scaler: Scaler used to scale targets, will be used to scale them back to normal during metric calculation
             metrics: a list of metrics the model will be evaluated against
-                Default: ``[R2Score(), MeanAbsoluteError()]``
+                Default: ``[R2Score(), MeanAbsoluteError(), PearsonCorrCoef()]``
             device: device where the operations will be computed on
                 Default: "cuda"
 
@@ -667,7 +739,8 @@ def evaluate(model, val_dataset, scaler, metrics = [R2Score(), MeanAbsoluteError
     sorted_targets = list(sorted_targets)
     sorted_outputs = list(sorted_outputs)
 
-    
+    print("####### EVALUATION METRICS ########")
+
     scores = []
     for metric in metrics:
         metric_score = metric.compute()
@@ -675,7 +748,6 @@ def evaluate(model, val_dataset, scaler, metrics = [R2Score(), MeanAbsoluteError
         metric_name = str(metric)[:-2]
         scores.append((metric_name, metric_score))
 
-        print("####### EVALUATION METRICS ########")
         print(f"{metric_name}: {metric_score}")
     
     plt.clf()  # Clears the current figure

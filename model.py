@@ -40,6 +40,7 @@ class InteractionModelATTN(nn.Module):
         self.gelu = nn.GELU()
         self.batch_norm = nn.BatchNorm1d(1)
         self.process = nn.Linear(384, 384)
+
         self.output = nn.Linear(384, 1)
 
         
