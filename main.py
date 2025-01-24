@@ -7,7 +7,8 @@ from datetime import datetime
 from datasets import load_dataset
 from transformers import TrainingArguments, HfArgumentParser
 from model import ModelArgs
-
+import argparse
+from argparse import RawTextHelpFormatter
 
 if __name__ == "__main__":
 
@@ -32,6 +33,27 @@ if __name__ == "__main__":
                         "val_all": True,
                         }
 
+    parser = argparse.ArgumentParser(description="RNA-Based DTI", formatter_class=RawTextHelpFormatter)
+    parser.add_argument('--task', '-t', type=int, required=True, help="Task to perform:\n\t1 for pretraining RNABERTa;\n\t2 for finetuning RNABERTa;\n\t3 for finetuning with crossvalidation\n\t4 for hyperparameter optimization;\n\t5 for training the tokenizer.")
+    parser.add_argument('--tok_file', '-tf', type=str, required=False, nargs='+', help="List of files for training the tokenizer")
+    args = parser.parse_args()
+
+    if args.task == 1:
+        raise NotImplementedError("Pretrain RNABERTa is not implemented yet")
+    elif args.task == 2:
+        raise NotImplementedError("Finetune RNABERTa is not implemented yet")
+    elif args.task == 3:
+        raise NotImplementedError("Finetune with crossvalidation is not implemented yet")
+    elif args.task == 4:
+        raise NotImplementedError("Optimize hyperparameters is not implemented yet")
+    elif args.task == 5:
+        if not args.tok_file:
+            print("Specify the files to train the tokenizer on using the -tf flag")
+            exit(1)
+        train.train_tokenizer(args.tok_file)
+    else:
+        print("Invalid task")
+        exit(1)
     """
     parser = HfArgumentParser((TrainingArguments, ModelArgs,))
     training_args, model_args = parser.parse_args_into_dataclasses(look_for_args_file=False, args=[
@@ -67,23 +89,21 @@ if __name__ == "__main__":
 
     train.pretrain_and_evaluate(training_args, target_encoder, target_tokenizer, True, None)
     """
-    # Try with smaller models
-    inters = pd.read_csv("processed/interactions/all.csv")
-    X = inters[["SMILES", "Target_RNA_sequence"]]
-    y = inters['pKd'].values
+    #inters = pd.read_csv("processed/interactions/all.csv")
+    #X = inters[["SMILES", "Target_RNA_sequence"]]
+    #y = inters['pKd'].values
 
             
-    scaler = model.StdScaler()
+    #scaler = model.StdScaler()
     #result = train.crossvalidate(X, y, 3, train_parameters, scaler, classes)
     #print(result)
     #finetune_model, accelerator, train_dataset, val_dataset, scaler = train.load_finetuned_model("saves/20250120_081621_best")
-    target_tokenizer, drug_tokenizer = train.__get_tokenizers__()
-    train_X, val_X, train_y, val_y = train.split(inters, X, y, train_size=0.9, random_state=42)
-    #rain_X, val_X, train_y, val_y = train_test_split(X, y, train_size=0.875, stratify=classes, random_state=42)
-    train_dataset, val_dataset = train.__prepare_train_val_datasets__(drug_tokenizer, target_tokenizer, train_X, val_X, train_y, val_y, scaler, plot=True)
-    accelerator, finetune_model = train.create_finetune_model(train_parameters)
-    scores, finetune_model = train.finetune_and_evaluate(finetune_model, accelerator, train_parameters, train_dataset, val_dataset, scaler)
-    train.save_finetuned_model(finetune_model, train_parameters, train_dataset, val_dataset, scaler)
+    #target_tokenizer, drug_tokenizer = train.__get_tokenizers__()
+    #train_X, val_X, train_y, val_y = train.split(inters, X, y, train_size=0.9, random_state=42)
+    #train_dataset, val_dataset = train.__prepare_train_val_datasets__(drug_tokenizer, target_tokenizer, train_X, val_X, train_y, val_y, scaler, plot=True)
+    #accelerator, finetune_model = train.create_finetune_model(train_parameters)
+    #scores, finetune_model = train.finetune_and_evaluate(finetune_model, accelerator, train_parameters, train_dataset, val_dataset, scaler)
+    #train.save_finetuned_model(finetune_model, train_parameters, train_dataset, val_dataset, scaler)
     #best_params = train.optimize(X, y, 10, scaler, classes, True)
 
     #accelerator, finetune_model = train.create_finetune_model(train_parameters)

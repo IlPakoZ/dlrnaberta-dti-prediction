@@ -39,7 +39,7 @@ def train_tokenizer(train_files):
     roberta_base_tokenizer = CharBPETokenizer()
 
     # Customize training (change vocab size)
-    roberta_base_tokenizer.train(train_files, vocab_size=2048, min_frequency=2, special_tokens=[
+    roberta_base_tokenizer.train(train_files, vocab_size=9000, min_frequency=2, special_tokens=[
         "<s>",
         "<pad>",
         "</s>",
