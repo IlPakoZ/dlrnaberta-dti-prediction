@@ -1,5 +1,5 @@
-# RNABert: RNA-based DTI prediction
-This is a repository for my Master's Thesis project "RNABert: Pretraining of RoBERTa on RNA-based targets for Drug-Target Interaction (DTI) prediction". The name is temporary.<br>
+# RNABERTa: RNA-based DTI prediction
+This is a repository for my Master's Thesis project "RNABERTa: Pretraining of RoBERTa on RNA-based targets for Drug-Target Interaction (DTI) prediction". The name is temporary.<br>
 
 A RoBERTa[^1] model is pretrained on RNA-sequences through a MLM task and used in conjuction to ChemBERTa-2[^2] to predict the binding of a drug to a RNA-based target.
 The model is composed of three parts:

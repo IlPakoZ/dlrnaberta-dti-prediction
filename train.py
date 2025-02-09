@@ -841,8 +841,16 @@ def __get_tokenizers__():
 
 def load_RNABERTa(hidden_size=512, num_hidden_layers=12, num_attention_heads=12):
     """
-        Returns the target encoder with the specified number of encoder blocks removed.
+        Initializes a RoBERTa target encoder given the hidden size, number of hidden layers and number of attention heads.
+        This method should be employed only for finetuning, since it does not apply muParametrization.
 
+        Parameters:
+            hidden_size (int): hidden size of the model
+                Default: 512
+            num_hidden_layers (int): number of hidden layers in the model
+                Default: 12
+            num_attention_heads (int): number of attention heads in the model
+                Default: 12
         Returns:
             the target encoder.
     """
@@ -963,16 +971,16 @@ def finetune_objective(trial, X, y, n_split, scaler, classes, short_mode):
                 Default: False
     """
     train_parameters = {
-        "train_batch_size": 4,
+        "train_batch_size": 16,
         "device": "cuda",
-        "gradient_accumulation_steps": trial.suggest_categorical("gradient_accumulation_steps", [4, 8, 16])}
+        "gradient_accumulation_steps":trial.suggest_categorical("gradient_accumulation_steps", [1, 2]),}
 
     gas = train_parameters["gradient_accumulation_steps"]
 
     train_parameters.update({
-                        "learning_rate": trial.suggest_float("learning_rate", 2e-6, 2e-5, log=True)*np.sqrt(gas*train_parameters["train_batch_size"]),
+                        "learning_rate": trial.suggest_float("learning_rate", 2e-6, 2e-4, log=True)*np.sqrt(gas*train_parameters["train_batch_size"]),
                         "adam_epsilon": 1e-6,
-                        "num_epochs":20,
+                        "num_epochs":200,
                         "log_performance_every":5,
                         "weight_decay": trial.suggest_float("weight_decay", 1e-3, 1e-1, log=True),
                         "model_dropout": trial.suggest_float("model_dropout", 0.1, 0.5),
@@ -999,26 +1007,45 @@ def finetune_optimize(X, y, n_split, scaler, classes, short_mode):
         Returns:
             The best hyperparameters found by the optimization.
     """
-    study = optuna.create_study(
-        direction="maximize",
-        sampler=optuna.samplers.TPESampler(seed=14),
-        study_name="finetuning_parameter_selection",
-        load_if_exists=True
-    )
+    torch.distributed.init_process_group(backend="nccl", init_method="env://")
+    rank = int(os.environ["RANK"])
+    world_size = os.environ["WORLD_SIZE"]
 
-    study.optimize(lambda trial: finetune_objective(trial, X, y, n_split, scaler, classes, short_mode), n_trials=100)
-    fig = optuna.visualization.plot_param_importances(study)
-    fig.write_image(f"{PLOT_DIR}/param_importances_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png")
+    print_if_0_rank("WORLD SIZE:", world_size)
 
-    fig = optuna.visualization.plot_parallel_coordinate(study)
-    fig.write_image(f"{PLOT_DIR}/parallel_coordinate_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png")
+    now = datetime.now().strftime('%Y%m%d_%H%M%S')
+    result_path = f"study_results/{now}"
 
-    if not os.path.exists("study_results"):
-        os.makedirs("study_results")
+    storage = "sqlite:///finetuning.db"
 
-    with open(f"study_results/finetune_best_params_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt", "w") as f:
-        for key, value in study.best_params.items():
-            f.write(f"{key}: {value}\n")
+    if rank == 0:
+        if not os.path.exists(result_path):
+            os.makedirs(result_path)
+    
+        study = optuna.create_study(
+            direction="maximize",
+            sampler=optuna.samplers.TPESampler(seed=(rank+1)*14),
+            study_name="finetuning_parameter_selection",
+            load_if_exists=True,
+            storage=storage)
+    
+    else:
+        study = optuna.load_study(
+            study_name="finetuning_parameter_selection",
+            storage=storage
+        )
+
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(rank)
+
+    study.optimize(lambda trial: finetune_objective(trial, X, y, n_split, scaler, classes, short_mode), n_trials=100//world_size, n_jobs=1)
+    torch.distributed.barrier()
+
+    if rank == 0:
+        save_study_plot(study, result_path)
+
+        with open(f"{result_path}/finetune_best_params.txt", "w") as f:
+            for key, value in study.best_params.items():
+                f.write(f"{key}: {value}\n")
 
     return study.best_params
 
@@ -1038,7 +1065,7 @@ def optuna_hp_space(trial):
     }
     return train_parameters
 
-def model_init(trial):
+def model_init(trial, full=False):
     """
         Helper function passed to the MuTrainer to initialize a new model.
         
@@ -1048,14 +1075,25 @@ def model_init(trial):
             A new model with the specified configuration.
     """
     target_tokenizer, _ = __get_tokenizers__()
-    target_config = mu.RobertaConfig(vocab_size=len(target_tokenizer),
-                                hidden_size=128,
-                                num_hidden_layers=12,
-                                num_attention_heads=16,  
-                                intermediate_size=1024,
-                                max_position_embeddings=514,
-                                attn_mult=(32**0.5),
-                                output_hidden_states=True)
+    if not full:
+        target_config = mu.RobertaConfig(vocab_size=len(target_tokenizer),
+                                    hidden_size=128,
+                                    num_hidden_layers=12,
+                                    num_attention_heads=16,  
+                                    intermediate_size=1024,
+                                    max_position_embeddings=514,
+                                    attn_mult=(32**0.5),
+                                    output_hidden_states=True)
+    else:
+        target_config = RobertaConfig(vocab_size=len(target_tokenizer),
+                                    hidden_size=512,
+                                    num_hidden_layers=12,  
+                                    num_attention_heads=16,  
+                                    intermediate_size=3072,
+                                    max_position_embeddings=514,
+                                    attn_mult=(32**0.5),
+                                    output_hidden_states=True)   
+        
     target_model = mu.RobertaForMaskedLM(config=target_config)
     print(f"Number of parameters in target_model: {sum(p.numel() for p in target_model.parameters())}")
     set_base_shapes(target_model, "roberta512.bsh")
@@ -1084,11 +1122,12 @@ def pretrain_optimize(path):
     rank = int(os.environ["RANK"])
     target_tokenizer, _ = __get_tokenizers__()
 
-    
     now = datetime.now().strftime('%Y%m%d_%H%M%S')
+    result_path = f"study_results/{now}"
+
     if rank == 0:
-        if not os.path.exists(f"study_results/{now}"):
-            os.makedirs(f"study_results/{now}")
+        if not os.path.exists(result_path):
+            os.makedirs(result_path)
     
     train_datapath = f'{path}/processed/dataset/train/train.txt'
     val_datapath = f'{path}/processed/dataset/test/test.txt'
@@ -1096,7 +1135,7 @@ def pretrain_optimize(path):
     data_collator = DataCollatorForLanguageModeling(tokenizer=target_tokenizer, mlm=True, mlm_probability=0.15)
 
     parser = HfArgumentParser((TrainingArguments, md.ModelArgs,))
-    print("WORLD SIZE:", os.environ["WORLD_SIZE"])
+    print_if_0_rank("WORLD SIZE:", os.environ["WORLD_SIZE"])
 
     training_args, model_args = parser.parse_args_into_dataclasses(look_for_args_file=False, args=[
         '--output_dir', 'tmp',
@@ -1129,28 +1168,35 @@ def pretrain_optimize(path):
     
     if rank == 0:
         study = optuna.load_study(study_name="pretraining_parameter_selection", storage=storage)
-        fig = optuna.visualization.plot_param_importances(study)
-        fig.update_layout(width=800, height=800)
-        fig.write_image(f"study_results/{now}/param_importances.png")
+        save_study_plot(study, result_path)
 
-        fig = optuna.visualization.plot_parallel_coordinate(study)
-        fig.update_layout(width=800, height=800)
-        fig.write_image(f"study_results/{now}/parallel_coordinate.png")
-
-        fig = optuna.visualization.plot_contour(study)
-        fig.update_layout(width=800, height=800)
-        fig.write_image(f"study_results/{now}/contour.png")
-
-    # Alternatively, if you'd like to see the parameter slices (which show the relationship between each parameter and the objective),
-    # you could use the plot_slice function:
-        fig = optuna.visualization.plot_slice(study)
-        fig.update_layout(width=800, height=800)
-        fig.write_image(f"study_results/{now}/slice.png")
-
-        with open(f"study_results/{now}/pretrain_best_params.txt", "w") as f:
+        with open(f"{result_path}/pretrain_best_params.txt", "w") as f:
             for key, value in study.best_params.items():
                f.write(f"{key}: {value}\n")
 
         optuna.delete_study(study_name="pretraining_parameter_selection", storage=storage)
 
+def save_study_plot(study, path):
+    """
+        Saves a series of plots from the Optuna study.
+    
+        Parameters:
+            study: Optuna study object
+            path (str): path where to save the plots
+    """
+    fig = optuna.visualization.plot_param_importances(study)
+    fig.update_layout(width=800, height=800)
+    fig.write_image(f"{path}/param_importances.png")
+
+    fig = optuna.visualization.plot_parallel_coordinate(study)
+    fig.update_layout(width=800, height=800)
+    fig.write_image(f"{path}/parallel_coordinate.png")
+
+    fig = optuna.visualization.plot_contour(study)
+    fig.update_layout(width=800, height=800)
+    fig.write_image(f"{path}/contour.png")
+
+    fig = optuna.visualization.plot_slice(study)
+    fig.update_layout(width=800, height=800)
+    fig.write_image(f"{path}/slice.png")
     
