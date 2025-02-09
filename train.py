@@ -2,16 +2,21 @@ from tokenizers.implementations import CharBPETokenizer
 from tokenizers.processors import BertProcessing
 from torchmetrics.regression import R2Score, MeanAbsoluteError, PearsonCorrCoef
 from datetime import datetime
-from transformers import AutoModelForMaskedLM, RobertaForMaskedLM, AutoTokenizer, RobertaTokenizerFast, DataCollatorForLanguageModeling, AutoModel, RobertaConfig
+
+from transformers import get_cosine_schedule_with_warmup, AutoTokenizer, RobertaConfig, RobertaForMaskedLM, RobertaTokenizerFast, DataCollatorForLanguageModeling, AutoModel
 from torch.utils.data import DataLoader
 from torch.optim import AdamW
 from accelerate import Accelerator, DeepSpeedPlugin
 from peft import LoraConfig, TaskType, get_peft_model, LoftQConfig
 from sklearn.model_selection import StratifiedKFold
-from transformers import Trainer, TrainingArguments
-from datasets import load_dataset
+from transformers import Trainer, TrainingArguments, HfArgumentParser
+from datasets import load_dataset, load_from_disk
 from sklearn.model_selection import train_test_split
+from mup import MuAdamW, set_base_shapes, make_base_shapes
+from datasets import config
+from model import MuTrainer
 
+import mutransformers as mu
 import matplotlib.pyplot as plt
 import torch.nn as nn
 import model as md
@@ -39,7 +44,7 @@ def train_tokenizer(train_files):
     roberta_base_tokenizer = CharBPETokenizer()
 
     # Customize training (change vocab size)
-    roberta_base_tokenizer.train(train_files, vocab_size=9000, min_frequency=2, special_tokens=[
+    roberta_base_tokenizer.train(train_files, vocab_size=9700, min_frequency=2, special_tokens=[
         "<s>",
         "<pad>",
         "</s>",
@@ -59,7 +64,6 @@ def __print_if_debug__(to_print, train_parameters):
     if "debug" in train_parameters:
         if train_parameters["debug"]:
             print(to_print)
-
 
 
 def __in_train_evaluate_model__(cpu_model, data_loader, train_parameters, state, scaler, thread_id):
@@ -126,6 +130,9 @@ def __check_mae_score_exit__(train_parameters, counter, train=True):
             counter (int): number of consecutive logging steps in which loss hasn't decreased
             train (bool): whether we are checking the train mae. If ``False``, validation mae is checked instead.
                 Default: ``True``
+
+        Return:
+            ``True`` if the mae score converged, ``False`` otherwise.
     """
     if train:
         check = "exit_if_train_mae_converges"
@@ -136,7 +143,6 @@ def __check_mae_score_exit__(train_parameters, counter, train=True):
         if counter >= 5:
             return True
     return False 
-
     
 # https://huggingface.co/docs/peft/main/en/task_guides/semantic_segmentation_lora
 def print_trainable_parameters(name, model):
@@ -144,6 +150,7 @@ def print_trainable_parameters(name, model):
         Prints the number of trainable parameters in the model.
         
         Parameters:
+            name (str): name of the model
             model: pytorch model
     """
     trainable_params = 0
@@ -160,10 +167,14 @@ def print_trainable_parameters(name, model):
 def __update_exit_conditions__(mean_loss, train_parameters, state):
     """
         Checks the additional exit conditions. Returns ``True`` if the training process is finished.
+
         Parameters:
             mean_loss (float): mean training loss.
             train_parameters (dict str -> obj): training parameters
             state (dict str -> float): state of the training process, used to memorize metrics and other important state variables
+
+        Returns:
+            ``True`` if the training process is completed, ``False`` otherwise.
     """
     to_exit = False
     if "exit_if_train_loss_less_than_or_converges" in train_parameters:
@@ -188,6 +199,10 @@ def __update_exit_conditions__(mean_loss, train_parameters, state):
 def __unscale__(target_value, scaler=None):
     """
         Unscales the labels using a scaler. If the scaler is not specified, don't do anything.
+
+        Parameters:
+            target_value: the target values to be unscaled
+            scaler: the scaler used to scale the target values
     """
     if scaler is None:
         return target_value
@@ -196,47 +211,112 @@ def __unscale__(target_value, scaler=None):
 def tokenize_function(tokenizer, examples):
     return tokenizer(examples["text"], padding="max_length", truncation=True, max_length=512, return_tensors="pt")
 
-def pretrain_and_evaluate(args, model, tokenizer, eval_only, checkpoint_path):
+def load_pretrain_data(path, train_datapath, val_datapath, tokenizer, eval_only=False):
     """
-        Pretrains and evaluates the RNA model. Pretraining consists of a Masked Language Modeling task.
+        Loads the pretraining data from the specified paths to RAM. 
+        If the data is not tokenized, it will be tokenized and saved to disk.
 
         Parameters:
-            args (DataClass): contains training parameters for the huggingface Trainer.
-            model: model to be pretrained
-            tokenizer: tokenizer of the model
-            eval_only: whether to only evaluate the performance of the model and not train it.
-            checkpoint_path: resume pretraining, starting from checkpoint in checkpoint_path.
-    """
-    data_files = {"val": args.test_datapath}
+            path (str): path to the directory where the pretraining datasets will be saved
+            train_datapath (str): path to the training data
+            val_datapath (str): path to the validation data
+            tokenizer: tokenizer used to tokenize the RNA sequences
+            eval_only (bool): if ``True``, only the validation data will be loaded
+                Default: ``False``
+            
+            Returns:
+                The datasets loaded into memory."""
+    
+    data_files = {"val": val_datapath}
     
     if eval_only:
         data_files["train"] = data_files["val"]
     else:
-        print(f'Loading and tokenizing training data is usually slow: {args.train_datapath}')
-        data_files["train"] = args.train_datapath
+        print_if_0_rank(f'Loading and tokenizing training data is usually slow: {train_datapath}')
+        data_files["train"] = train_datapath
 
-    datasets = load_dataset("text", data_files=data_files)
-    datasets = datasets.map(lambda x: tokenize_function(tokenizer, x), batched=True)
+    if not os.path.exists(f"{path}/data/pretraining"):
+        datasets = load_dataset("text", data_files=data_files)
 
-    data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=True, mlm_probability=0.15)
-    trainer = Trainer(model=model, args=args, data_collator=data_collator,
-                      train_dataset=datasets["train"], eval_dataset=datasets["val"],)
+        cache_files = {
+             "train": f"{path}/train.parquet",
+             "val": f"{path}/val.parquet"
+        }
         
-    print("I'm evaluating...")
-    eval_loss = trainer.evaluate()
-    eval_loss = eval_loss['eval_loss']
-    print(f"Initial eval bpc: {eval_loss/math.log(2)}")
+        datasets = datasets.map(lambda x: tokenize_function(tokenizer, x), batched=True, num_proc=10, cache_file_names=cache_files, load_from_cache_file=True)
+    
+        datasets.save_to_disk(f"{path}/data/pretraining")
+    else:
+        config.IN_MEMORY_MAX_SIZE = 45 * 1024**3        
+        datasets = load_from_disk(f"{path}/data/pretraining", keep_in_memory=True)
+    
+    return datasets
 
+def print_if_0_rank(string):
+    rank = int(os.environ["RANK"])
+    if rank == 0:
+        print(string)
+
+
+def pretrain_and_evaluate(args, training_parameters, datasets, model, tokenizer, eval_only, checkpoint_path=None, eval_first=False, save_result=True):
+    """
+        Pretrains the target encoder model and evaluates it on the validation data.
+        This method assumes the model uses muParametrization.
+
+        Parameters:
+            args: training arguments
+            training_parameters (dict str -> obj): training parameters
+            datasets: dataset containing training and validation data for pretraining
+            model: the model to be trained (target encoder)
+            tokenizer: tokenizer used to tokenize the RNA sequences
+            eval_only (bool): if ``True``, only validation will be performed
+            checkpoint_path (str): path to the checkpoint from which to resume training
+                Default: ``None``
+            eval_first (bool): if ``True``, the model will be evaluated before training
+                Default: ``False``
+            save_result (bool): if ``True``, the pretrained model will be saved after training
+                Default: ``True``
+    """
+    data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=True, mlm_probability=0.15)
+    optimizer = MuAdamW(model.parameters(), lr=training_parameters["learning_rate"], weight_decay=training_parameters["weight_decay"], eps=training_parameters["adam_epsilon"])    
+
+    if hasattr(args, "max_steps"):
+        num_training_steps = args.max_steps
+        print_if_0_rank("MAX STEPS MODE")
+    elif hasattr(args, "num_train_epochs"):
+        num_training_steps = len(datasets["train"]) * args.num_train_epochs // (args.per_device_train_batch_size*args.gradient_accumulation_steps)
+        print_if_0_rank("NUM_EPOCHS MODE")
+    else:
+        raise ValueError("Neither 'num_train_epochs' nor 'num_training_steps' is specified in the training arguments.")
+    scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=training_parameters["warmup_ratio"]*num_training_steps, num_training_steps=num_training_steps, num_cycles=0.41)
+    trainer = Trainer(model=model, args=args, data_collator=data_collator,
+                      train_dataset=datasets["train"], eval_dataset=datasets["val"], optimizers=(optimizer, scheduler))
+    
+    print(f"Trial started at {datetime.now().strftime('%H:%M:%S')}")
+    
+    if eval_first:
+        print_if_0_rank("I'm evaluating...")
+        eval_loss = trainer.evaluate()
+        eval_loss = eval_loss['eval_loss']/math.log(2)
+        print_if_0_rank(f"Initial eval bpc: {eval_loss}")
+    
     output_dir = "./pretrained"
     if not eval_only:
-        print("I'm training...")
+        print_if_0_rank("I'm training...")
         trainer.train(resume_from_checkpoint=checkpoint_path)
-        trainer.save_model(output_dir=output_dir)
-
+        if save_result:
+            trainer.save_model(output_dir=output_dir)
+        train_loss = trainer.state.log_history[-1]["train_loss"]/math.log(2)
+        print(f"Train loss: {train_loss}")
+        if "train_flos" in trainer.state.log_history[-1]:
+            print_if_0_rank("Total FLOS:", trainer.state.log_history[-1]["train_flos"])
         eval_loss = trainer.evaluate()
-        eval_loss = eval_loss['eval_loss']
-        print(f"Eval bpc after pretraining: {eval_loss/math.log(2)}")
-    
+        eval_loss = eval_loss['eval_loss']/math.log(2)
+
+        print_if_0_rank(f"Eval bpc after pretraining: {eval_loss}")
+
+    return eval_loss, train_loss
+
 def split(inters, X, y, train_size, random_state):
     """
     Splits the interaction datasets into training and validation sets while ensuring that 
@@ -668,29 +748,6 @@ def get_crossvalidate_datasets(X, y, n_split, scaler, classes, plot=False):
 
         yield train_dataset, val_dataset
 
-def deleteEncodingLayers(model, num_layers_to_remove):  # must pass in the full bert model
-    """
-    Removes layers from a RoBERTa model to get a smaller model.
-    
-    Parameters:
-        model: a RoBERTa model.
-        num_layers_to_remove (int): number of layers to remove.
-
-    Returns:
-        a copy of the original model with the number of layers specified removed.
-    """
-    oldModuleList = model.roberta.encoder.layer
-    newModuleList = nn.ModuleList()
-
-    # Now iterate over all layers, only keepign only the relevant layers.
-    for i in range(0, len(oldModuleList)-num_layers_to_remove):
-        newModuleList.append(oldModuleList[i])
-
-    # create a copy of the model, modify it with the new list, and return
-    copyOfModel = copy.deepcopy(model)
-    copyOfModel.roberta.encoder.layer = newModuleList
-
-    return copyOfModel
     
 def evaluate(model, val_dataset, scaler, metrics = [R2Score(), MeanAbsoluteError(), PearsonCorrCoef()], device = "cuda"):
     """
@@ -782,7 +839,7 @@ def __get_tokenizers__():
 
     return target_tokenizer, drug_tokenizer
 
-def load_RNABERTa(layers_to_remove):
+def load_RNABERTa(hidden_size=512, num_hidden_layers=12, num_attention_heads=12):
     """
         Returns the target encoder with the specified number of encoder blocks removed.
 
@@ -791,16 +848,15 @@ def load_RNABERTa(layers_to_remove):
     """
     target_tokenizer, _ = __get_tokenizers__()
     configuration = RobertaConfig(vocab_size=len(target_tokenizer),
-                                hidden_size=384,
-                                num_hidden_layers=12,  
-                                num_attention_heads=12,  
+                                hidden_size=hidden_size,
+                                num_hidden_layers=num_hidden_layers,  
+                                num_attention_heads=num_attention_heads,  
                                 intermediate_size=3072,
                                 max_position_embeddings=514,
+                                attn_mult=(32**0.5),
                                 output_hidden_states=True)
 
     target_encoder = RobertaForMaskedLM(configuration)
-
-    target_encoder = deleteEncodingLayers(target_encoder, layers_to_remove)
     return target_encoder    
 
 def create_finetune_model(train_parameters, from_pretrained=None):
@@ -819,7 +875,7 @@ def create_finetune_model(train_parameters, from_pretrained=None):
     torch.cuda.empty_cache()
 
     drug_encoder = AutoModel.from_pretrained("DeepChem/ChemBERTa-77M-MTR", output_hidden_states=True)
-    target_encoder = load_RNABERTa(train_parameters["layers_to_remove"])
+    target_encoder = load_RNABERTa(train_parameters["hidden_size"], train_parameters["hidden_layers"], train_parameters["num_attention_heads"])
 
     loftq_config = LoftQConfig(loftq_bits=8)           
     lora_config_target = LoraConfig(r=train_parameters["lora_r"],
@@ -864,8 +920,48 @@ def create_finetune_model(train_parameters, from_pretrained=None):
 
     return accelerator, model
 
-def objective(trial, X, y, n_split, scaler, classes, short_mode):
+def make_bsh(filename=None):
+    """
+        Creates the base shapes for the model to allow MuParametrization.
+    """
+    tokenizer, _ = __get_tokenizers__()
+    base_config = RobertaConfig(vocab_size=len(tokenizer),
+                                hidden_size=512,
+                                num_hidden_layers=12,  
+                                num_attention_heads=16,  
+                                intermediate_size=3072,
+                                max_position_embeddings=514,
+                                attn_mult=(32**0.5),
+                                output_hidden_states=True)
+    base_model = RobertaForMaskedLM(config=base_config)
+    # define a delta models where we vary all "widths" we want to vary
 
+    delta_config = RobertaConfig(vocab_size=len(tokenizer),
+                                    hidden_size=128,
+                                    num_hidden_layers=12,  
+                                    num_attention_heads=16,  
+                                    intermediate_size=512,
+                                    max_position_embeddings=514,
+                                    attn_mult=(32**0.5),
+                                    output_hidden_states=True)
+    delta_model = RobertaForMaskedLM(config=delta_config)
+    base_shapes = make_base_shapes(base_model, delta_model, savefile=filename)
+    return base_shapes
+
+def finetune_objective(trial, X, y, n_split, scaler, classes, short_mode):
+    """
+        Objective function for the Optuna optimization of the finetuning hyperparameters.
+        
+        Parameters:
+            trial: Optuna trial object
+            X (pandas.DataFrame): dataframe containing data used for prediction
+            y (List): list containing labels to predict for each interaction (dissociation constant)
+            n_split (int): number of cross validation folds to split the data into
+            scaler: scaler to apply on labels
+            classes (List): classes by which to stratify the folds.
+            short_mode (bool): if True, crossvalidation is not complete, meaning that only three rounds of crossvalidation are applied.
+                Default: False
+    """
     train_parameters = {
         "train_batch_size": 4,
         "device": "cuda",
@@ -889,7 +985,8 @@ def objective(trial, X, y, n_split, scaler, classes, short_mode):
     results = crossvalidate(X, y, n_split, train_parameters, scaler, classes, short_mode)
     return np.mean(results["R2Score"][:2])
 
-def optimize(X, y, n_split, scaler, classes, short_mode):
+
+def finetune_optimize(X, y, n_split, scaler, classes, short_mode):
     """
         Use Optuna TPESampler to optimize finetuning parameters.
         
@@ -899,6 +996,8 @@ def optimize(X, y, n_split, scaler, classes, short_mode):
             n_split (int): number of cross validation folds to split the data into
             scaler: scaler to apply on labels
             classes (List): classes by which to stratify the folds.
+        Returns:
+            The best hyperparameters found by the optimization.
     """
     study = optuna.create_study(
         direction="maximize",
@@ -907,6 +1006,151 @@ def optimize(X, y, n_split, scaler, classes, short_mode):
         load_if_exists=True
     )
 
-    study.optimize(lambda trial: objective(trial, X, y, n_split, scaler, classes, short_mode), n_trials=20)
+    study.optimize(lambda trial: finetune_objective(trial, X, y, n_split, scaler, classes, short_mode), n_trials=100)
+    fig = optuna.visualization.plot_param_importances(study)
+    fig.write_image(f"{PLOT_DIR}/param_importances_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png")
+
+    fig = optuna.visualization.plot_parallel_coordinate(study)
+    fig.write_image(f"{PLOT_DIR}/parallel_coordinate_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png")
+
+    if not os.path.exists("study_results"):
+        os.makedirs("study_results")
+
+    with open(f"study_results/finetune_best_params_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt", "w") as f:
+        for key, value in study.best_params.items():
+            f.write(f"{key}: {value}\n")
 
     return study.best_params
+
+
+def optuna_hp_space(trial):
+    """
+        Defines the hyperparameter space for the Optuna optimization.
+        
+        Parameters:
+            trial: Optuna trial object
+        Returns:
+            A dictionary containing the hyperparameters to optimize.
+    """
+    train_parameters = {
+        "learning_rate": trial.suggest_float("learning_rate", 1e-4, 5e-2, log=True),
+        "warmup_ratio": trial.suggest_float("warmup_ratio", 0.01, 0.1),
+    }
+    return train_parameters
+
+def model_init(trial):
+    """
+        Helper function passed to the MuTrainer to initialize a new model.
+        
+        Parameters:
+            trial: Optuna trial object
+        Returns:
+            A new model with the specified configuration.
+    """
+    target_tokenizer, _ = __get_tokenizers__()
+    target_config = mu.RobertaConfig(vocab_size=len(target_tokenizer),
+                                hidden_size=128,
+                                num_hidden_layers=12,
+                                num_attention_heads=16,  
+                                intermediate_size=1024,
+                                max_position_embeddings=514,
+                                attn_mult=(32**0.5),
+                                output_hidden_states=True)
+    target_model = mu.RobertaForMaskedLM(config=target_config)
+    print(f"Number of parameters in target_model: {sum(p.numel() for p in target_model.parameters())}")
+    set_base_shapes(target_model, "roberta512.bsh")
+    return target_model
+
+def compute_objective(metrics):
+    """
+        Given a metric dictionary, computes the objective value for the optimization.
+
+        Parameters:
+            metrics: dictionary containing the evaluation metrics of the model
+    """
+    return metrics["eval_loss"]/math.log(2)
+
+def pretrain_optimize(path):
+    """
+        Use Optuna TPESampler to optimize pretraining parameters.
+        The "RANK" environment variable is used to allow for multi-GPU training.
+        MuParametrization is used.
+        Saves a series of plots from the Optuna study and the best parameters in a text file.
+        
+        Parameters:
+            path: path where to save or load the tokenized pretraining datasets.
+    """
+    torch.distributed.init_process_group(backend="nccl", init_method="env://")
+    rank = int(os.environ["RANK"])
+    target_tokenizer, _ = __get_tokenizers__()
+
+    
+    now = datetime.now().strftime('%Y%m%d_%H%M%S')
+    if rank == 0:
+        if not os.path.exists(f"study_results/{now}"):
+            os.makedirs(f"study_results/{now}")
+    
+    train_datapath = f'{path}/processed/dataset/train/train.txt'
+    val_datapath = f'{path}/processed/dataset/test/test.txt'
+    datasets = load_pretrain_data(path, train_datapath, val_datapath, target_tokenizer) 
+    data_collator = DataCollatorForLanguageModeling(tokenizer=target_tokenizer, mlm=True, mlm_probability=0.15)
+
+    parser = HfArgumentParser((TrainingArguments, md.ModelArgs,))
+    print("WORLD SIZE:", os.environ["WORLD_SIZE"])
+
+    training_args, model_args = parser.parse_args_into_dataclasses(look_for_args_file=False, args=[
+        '--output_dir', 'tmp',
+        '--logging_steps', '200',
+        '--save_strategy', 'no',
+        '--max_grad_norm', '10.0',
+        '--per_device_eval_batch_size', '64',
+        '--per_device_train_batch_size', '32',
+        '--gradient_accumulation_steps', str(8//int(os.environ["WORLD_SIZE"])),
+        '--do_train',
+        '--do_eval',
+        '--max_steps', '5000',
+        '--dataloader_pin_memory', 'True',      
+        '--weight_decay', '0.01',
+        '--adam_epsilon', '1e-6',
+        '--ddp_find_unused_parameters', 'False'
+    ])
+
+    trainer = MuTrainer(
+        model=None,
+        args=training_args,
+        train_dataset=datasets["train"],
+        eval_dataset=datasets["val"],
+        model_init=model_init,
+        data_collator=data_collator
+    )
+
+    storage = "sqlite:///pretraining.db"
+    est_run = trainer.hyperparameter_search(hp_space=optuna_hp_space, direction="minimize", backend="optuna", compute_objective=compute_objective, n_trials=32, study_name="pretraining_parameter_selection", storage=storage)
+    
+    if rank == 0:
+        study = optuna.load_study(study_name="pretraining_parameter_selection", storage=storage)
+        fig = optuna.visualization.plot_param_importances(study)
+        fig.update_layout(width=800, height=800)
+        fig.write_image(f"study_results/{now}/param_importances.png")
+
+        fig = optuna.visualization.plot_parallel_coordinate(study)
+        fig.update_layout(width=800, height=800)
+        fig.write_image(f"study_results/{now}/parallel_coordinate.png")
+
+        fig = optuna.visualization.plot_contour(study)
+        fig.update_layout(width=800, height=800)
+        fig.write_image(f"study_results/{now}/contour.png")
+
+    # Alternatively, if you'd like to see the parameter slices (which show the relationship between each parameter and the objective),
+    # you could use the plot_slice function:
+        fig = optuna.visualization.plot_slice(study)
+        fig.update_layout(width=800, height=800)
+        fig.write_image(f"study_results/{now}/slice.png")
+
+        with open(f"study_results/{now}/pretrain_best_params.txt", "w") as f:
+            for key, value in study.best_params.items():
+               f.write(f"{key}: {value}\n")
+
+        optuna.delete_study(study_name="pretraining_parameter_selection", storage=storage)
+
+    

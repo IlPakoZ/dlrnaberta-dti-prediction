@@ -4,8 +4,10 @@ import pandas as pd
 import numpy as np
 import pickle
 from torch.utils.data import Dataset
-from transformers import PretrainedConfig, PreTrainedModel
+from transformers import PretrainedConfig, PreTrainedModel, Trainer, get_cosine_schedule_with_warmup
+from mup import MuAdamW
 from dataclasses import dataclass, field
+from transformers.trainer import IS_SAGEMAKER_MP_POST_1_10
 
 # The key is the drug because it binds to the target (like the key of a lock)
 class InteractionModelATTNConfig(PretrainedConfig):
@@ -32,6 +34,9 @@ class InteractionModelATTN(nn.Module):
         super().__init__()
         self.target_encoder = target_encoder
         self.drug_encoder = drug_encoder
+        self.lin_map = nn.Linear(512, 384)
+        self.dropout_map = nn.Dropout(dropout)
+
         self.multihead_attention = nn.MultiheadAttention(384, num_heads, dropout = dropout, batch_first=True)
         self.conv = nn.Conv1d(in_channels=512, out_channels=1, kernel_size=1)
         self.dropout = nn.Dropout(dropout)
@@ -47,6 +52,9 @@ class InteractionModelATTN(nn.Module):
     def forward(self, x1, x2):
         y1 = self.target_encoder(**x1).hidden_states[-1]       # The target
         y2 = self.drug_encoder(**x2).hidden_states[-1]         # The drug
+
+        y1 = self.lin_map(y1)
+        y1 = self.dropout_map(y1)
 
         key_padding_mask = torch.squeeze(x2["attention_mask"], axis=1).bool() # This doesn't work in multihead_attention
         out, _ = self.multihead_attention(y1, y2, y1, key_padding_mask=torch.squeeze(x2["attention_mask"].float(), axis=1))
@@ -64,6 +72,19 @@ class InteractionModelATTN(nn.Module):
         out = self.output(out)
 
         return out
+    
+class MuTrainer(Trainer):
+
+    def create_optimizer_and_scheduler(self, num_training_steps: int):
+        self.optimizer = MuAdamW(self.model.parameters(), lr=self.args.learning_rate, weight_decay=self.args.weight_decay, eps=self.args.adam_epsilon)
+                
+        #smp.state.cfg.fp16
+        if IS_SAGEMAKER_MP_POST_1_10 and False:
+            # If smp >= 1.10 and fp16 is enabled, we unwrap the optimizer
+            optimizer = self.optimizer.optimizer
+        else:
+            optimizer = self.optimizer
+        self.scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=self.args.warmup_ratio*num_training_steps, num_training_steps=num_training_steps, num_cycles=0.41)
 
 class InterDataset(Dataset):
     def __init__(self, targets, smiles, pkd=None):
