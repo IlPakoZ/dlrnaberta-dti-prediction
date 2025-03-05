@@ -1,3 +1,4 @@
+
 from tokenizers.implementations import CharBPETokenizer
 from tokenizers.processors import BertProcessing
 from torchmetrics.regression import R2Score, MeanAbsoluteError, PearsonCorrCoef
@@ -6,8 +7,7 @@ from datetime import datetime
 from transformers import get_cosine_schedule_with_warmup, AutoTokenizer, RobertaConfig, RobertaForMaskedLM, RobertaTokenizerFast, DataCollatorForLanguageModeling, AutoModel
 from torch.utils.data import DataLoader
 from torch.optim import AdamW
-from accelerate import Accelerator, DeepSpeedPlugin
-from peft import LoraConfig, TaskType, get_peft_model, LoftQConfig
+from accelerate import Accelerator
 from sklearn.model_selection import StratifiedKFold
 from transformers import Trainer, TrainingArguments, HfArgumentParser
 from datasets import load_dataset, load_from_disk
@@ -15,6 +15,7 @@ from sklearn.model_selection import train_test_split
 from mup import MuAdamW, set_base_shapes, make_base_shapes
 from datasets import config
 from model import MuTrainer
+from accelerate.utils import DistributedDataParallelKwargs
 
 import mutransformers as mu
 import matplotlib.pyplot as plt
@@ -23,14 +24,16 @@ import model as md
 import numpy as np
 import pandas as pd
 import torch
-import threading
 import copy
 import optuna
 import os
 import pickle
 import math
+import gc
+import psutil
 
-PLOT_DIR = "plots"
+creation_time = datetime.now().strftime('%Y%m%d_%H%M%S')
+PLOT_DIR = f"plots/{creation_time}"
 
 def train_tokenizer(train_files):
     """
@@ -66,33 +69,34 @@ def __print_if_debug__(to_print, train_parameters):
             print(to_print)
 
 
-def __in_train_evaluate_model__(cpu_model, data_loader, train_parameters, state, scaler, thread_id):
+def __in_train_evaluate_model__(model, accelerator, val_dataset, state, scaler, thread_id):
     """
         Evaluates the model on the validation data. 
-        Evaluation is done on CPU, so that the training can keep going in the meanwhile.    
 
         Parameters:
-            cpu_model: the model to be evaluated
-            data_loader (torch DataLoader): data loader containing the validation data
-            train_parameters (dict str -> obj): training parameters
+            model: the model to be evaluated
+            accelerator: transformers accelerator used in training the model
+            val_dataset (torch Dataset): the validation dataset
             state (dict str -> float): state of the training process, used to memorize metrics and other important state variables
             scaler: Scaler used to scale targets, will be used to scale them back to normal during metric calculation
             thread_id (str): name of the thread
     """
-    cpu_model.eval() 
+    has_local = "LOCAL_RANK" in os.environ
+    model.eval() 
+    val_loader = DataLoader(val_dataset, shuffle=True)
+    val_loader = accelerator.prepare(val_loader)
 
-    r2_metric = R2Score()
-    mae_metric = MeanAbsoluteError()
-    pearson_r_metric = PearsonCorrCoef()
+    r2_metric = R2Score().to(model.device)
+    mae_metric = MeanAbsoluteError().to(model.device)
+    pearson_r_metric = PearsonCorrCoef().to(model.device)
+    r2_metric, mae_metric, pearson_r_metric = accelerator.prepare(r2_metric, mae_metric, pearson_r_metric)
+
     eval_n = 0
 
     with torch.no_grad():
-        for source, targets in data_loader:
-            if not "val_all" in train_parameters:
-                if eval_n > (train_parameters["gradient_accumulation_steps"]*train_parameters["log_performance_every"])//3:
-                    break
-            targets = targets.reshape(-1, 1)
-            output = cpu_model(source[0], source[1])
+        for source, targets in val_loader:
+            targets = targets.reshape(-1, 1).to(model.device)
+            output = model(source[0], source[1])
             
             targets = __unscale__(targets, scaler)
             output = __unscale__(output, scaler)
@@ -105,19 +109,26 @@ def __in_train_evaluate_model__(cpu_model, data_loader, train_parameters, state,
 
 
     state["last_valid_mae_score"] = state["valid_mae_score"]
+    if has_local:
+        torch.distributed.barrier()
     state["valid_r2_score"] = r2_metric.compute()
     state["valid_mae_score"] = mae_metric.compute()
     state["valid_pearson_r_score"] = pearson_r_metric.compute()
+    
     if state["valid_r2_score"] > state["best_r2"]: 
         state["best_r2"] = state["valid_r2_score"]
         state["best_mae_score"] = state["valid_mae_score"]
-        state["best_model"] = cpu_model
+        state["best_model"] = copy.deepcopy(model)
 
-    state["val_maes"].append(state["valid_mae_score"])
-    state["val_r2s"].append(state["valid_r2_score"])
-    state["val_pears"].append(state["valid_pearson_r_score"])
-
-    print(f"Step {thread_id} - R2 val: {state['valid_r2_score']:.4f}, MAE val: {state['valid_mae_score']:.4f}, Pearson R val: {state['valid_pearson_r_score']:.4f}")
+    state["val_maes"].append(state["valid_mae_score"].cpu())
+    state["val_r2s"].append(state["valid_r2_score"].cpu())
+    state["val_pears"].append(state["valid_pearson_r_score"].cpu())
+    
+    accelerator.free_memory(r2_metric, mae_metric, pearson_r_metric)
+    del r2_metric
+    del mae_metric
+    del pearson_r_metric
+    print_if_0_rank(f"Step {thread_id} - R2 val: {state['valid_r2_score']:.4f}, MAE val: {state['valid_mae_score']:.4f}, Pearson R val: {state['valid_pearson_r_score']:.4f}")
       
 
 def __check_mae_score_exit__(train_parameters, counter, train=True):
@@ -252,10 +263,10 @@ def load_pretrain_data(path, train_datapath, val_datapath, tokenizer, eval_only=
     
     return datasets
 
-def print_if_0_rank(string):
-    rank = int(os.environ["RANK"])
+def print_if_0_rank(*args):    
+    rank = int(os.environ.get("RANK", "0"))
     if rank == 0:
-        print(string)
+        print(*args)
 
 
 def pretrain_and_evaluate(args, training_parameters, datasets, model, tokenizer, eval_only, checkpoint_path=None, eval_first=False, save_result=True):
@@ -280,18 +291,17 @@ def pretrain_and_evaluate(args, training_parameters, datasets, model, tokenizer,
     data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=True, mlm_probability=0.15)
     optimizer = MuAdamW(model.parameters(), lr=training_parameters["learning_rate"], weight_decay=training_parameters["weight_decay"], eps=training_parameters["adam_epsilon"])    
 
-    if hasattr(args, "max_steps"):
+    if args.max_steps > 0:
         num_training_steps = args.max_steps
         print_if_0_rank("MAX STEPS MODE")
-    elif hasattr(args, "num_train_epochs"):
-        num_training_steps = len(datasets["train"]) * args.num_train_epochs // (args.per_device_train_batch_size*args.gradient_accumulation_steps)
-        print_if_0_rank("NUM_EPOCHS MODE")
     else:
-        raise ValueError("Neither 'num_train_epochs' nor 'num_training_steps' is specified in the training arguments.")
-    scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=training_parameters["warmup_ratio"]*num_training_steps, num_training_steps=num_training_steps, num_cycles=0.41)
+        num_training_steps = len(datasets["train"]) * args.num_train_epochs // (args.per_device_train_batch_size*args.gradient_accumulation_steps*int(os.environ["WORLD_SIZE"]))
+        print_if_0_rank("NUM_EPOCHS MODE")
+
+    scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=training_parameters["warmup_ratio"]*5000, num_training_steps=num_training_steps, num_cycles=0.41)
     trainer = Trainer(model=model, args=args, data_collator=data_collator,
                       train_dataset=datasets["train"], eval_dataset=datasets["val"], optimizers=(optimizer, scheduler))
-    
+    print(training_parameters["warmup_ratio"]*5000, num_training_steps)
     print(f"Trial started at {datetime.now().strftime('%H:%M:%S')}")
     
     if eval_first:
@@ -300,16 +310,32 @@ def pretrain_and_evaluate(args, training_parameters, datasets, model, tokenizer,
         eval_loss = eval_loss['eval_loss']/math.log(2)
         print_if_0_rank(f"Initial eval bpc: {eval_loss}")
     
-    output_dir = "./pretrained"
     if not eval_only:
         print_if_0_rank("I'm training...")
         trainer.train(resume_from_checkpoint=checkpoint_path)
         if save_result:
-            trainer.save_model(output_dir=output_dir)
-        train_loss = trainer.state.log_history[-1]["train_loss"]/math.log(2)
-        print(f"Train loss: {train_loss}")
+            trainer.save_model(output_dir=args.output_dir)
+        train_loss = trainer.state.log_history[-1]["train_loss"]
+        print_if_0_rank(f"Train loss: {train_loss}")
         if "train_flos" in trainer.state.log_history[-1]:
             print_if_0_rank("Total FLOS:", trainer.state.log_history[-1]["train_flos"])
+
+        # Plot training and validation loss
+        training_loss = [log["loss"]/math.log(2) for log in trainer.state.log_history if "loss" in log]
+        validation_loss = [log["eval_loss"]/math.log(2) for log in trainer.state.log_history if "eval_loss" in log]
+        if int(os.environ["RANK"]) == 0:
+            plt.figure(figsize=(10, 5))
+            x = range(int(args.logging_steps), (len(training_loss)+1)*int(args.logging_steps), int(args.logging_steps))
+            plt.plot(x, training_loss, label="Training Loss")
+            plt.plot(x, validation_loss, label="Validation Loss")
+            plt.xlabel("Steps")
+            plt.ylabel("Loss")
+            plt.title("Training and Validation Loss")
+            plt.legend()
+            plt.grid(True)
+            plt.savefig(f"{args.output_dir}/training_validation_loss.png")
+
+
         eval_loss = trainer.evaluate()
         eval_loss = eval_loss['eval_loss']/math.log(2)
 
@@ -330,11 +356,12 @@ def split(inters, X, y, train_size, random_state):
         train_size (float): Proportion of the dataset to include in the training set.
         random_state (int): Random seed for reproducibility.
     Returns:
-    tuple: A tuple containing the training and validation feature matrices (train_X, val_X) 
-           and the training and validation target vectors (train_y, val_y).
+        A tuple containing the training and validation feature matrices (train_X, val_X) 
+        and the training and validation target vectors (train_y, val_y).
     """
-    classes = list(zip(inters["Category"].values, (inters["pKd"]+0.5).astype(int)))    
-    
+    #classes = list(zip(inters["Category"].values, (inters["pKd"]+0.5).astype(int)))    
+    classes = [f"{cat}_{int(pkd+0.5)}" for cat, pkd in zip(inters["Category"].values, inters["pKd"].values)]
+
     vals = dict()
     for i in range(len(classes)):
         c = classes[i]
@@ -378,48 +405,61 @@ def finetune_and_evaluate(model, accelerator, train_parameters, train_dataset, v
             A list containing the values of the ``R2Score`` and ``MeanAbsoluteError`` metrics
 
     """
-    device = accelerator.device
-    
-    r2_train = R2Score().to(device)
-    mae_train = MeanAbsoluteError().to(device)
-    pearson_r_train = PearsonCorrCoef().to(device)
-    
+    has_local = "LOCAL_RANK" in os.environ
+    world_size = int(os.getenv("WORLD_SIZE", 1))
+    r2_train = R2Score()
+    mae_train = MeanAbsoluteError()
+    pearson_r_train = PearsonCorrCoef()
     state = {"valid_mae_score":0, "train_mae_score":0, "train_r2_score":0, "train_pearson_r_score":0, "valid_r2_score":0, "valid_pearson_r_score": 0, "counter_train":0, "counter_valid":0, "last_train_mae_score":0, "last_valid_mae_score":0, "best_r2":-100, "val_maes":[], "val_r2s":[], "val_pears":[]}
 
     optimizer = AdamW(model.parameters(), lr=train_parameters["learning_rate"], weight_decay=train_parameters["weight_decay"])
     train_loader = DataLoader(train_dataset, batch_size=train_parameters["train_batch_size"], shuffle=True)
-    val_loader = DataLoader(val_dataset, shuffle=True)
-    with torch.no_grad():
-        for source, targets in val_loader:
-            source1, targets1 = source, targets
-            break
 
-    model, optimizer, train_loader = accelerator.prepare(model, optimizer, train_loader)
-    print(f"ALLOCATED MEMORY ON CUDA: {torch.cuda.memory_allocated() / 1e6:.2f} MB")
-    
-    print(accelerator.state)
-    if accelerator.state.deepspeed_plugin is not None:
-        print("DeepSpeed Plugin is enabled and working.")
+    if "num_training_steps" in train_parameters:
+        max_steps = train_parameters["num_training_steps"]//world_size
     else:
-        print("DeepSpeed Plugin is not enabled.")
+        max_steps = train_parameters["num_epochs"]*len(train_loader)//world_size
+
+    warmup_steps = 0
+
+    scheduler_training_steps = max_steps*world_size if "override_scheduler_steps" not in train_parameters else train_parameters["override_scheduler_steps"]
+    # Create the cosine scheduler with warmup
+    scheduler = get_cosine_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=warmup_steps*world_size,
+        num_training_steps=scheduler_training_steps,
+        num_cycles=train_parameters["num_cycles"]
+    )
+
+    # Prepare objects for distributed training with Accelerator
+    model, optimizer, train_loader = accelerator.prepare(
+        model, optimizer, train_loader
+    )
+    r2_train, mae_train, pearson_r_train = accelerator.prepare(r2_train, mae_train, pearson_r_train)
+    scheduler = accelerator.prepare(scheduler)
+
+    print_if_0_rank(f"ALLOCATED MEMORY ON CUDA: {torch.cuda.memory_allocated() / 1e6:.2f} MB")
+    
+    print_if_0_rank(accelerator.state)
+    if accelerator.state.deepspeed_plugin is not None:
+        print_if_0_rank("DeepSpeed Plugin is enabled and working.")
+    else:
+        print_if_0_rank("DeepSpeed Plugin is not enabled.")
     model.train()
 
     step = 0  # Initialize the step variable
     epoch = 1
-    if "num_training_steps" in train_parameters:
-        max_steps = train_parameters["num_training_steps"]
-    else:
-        max_steps = train_parameters["num_epochs"]*len(train_loader)
 
-    print(f"Training for {max_steps} steps")
+
+    print_if_0_rank(f"Training for {max_steps} steps")
     criterion = torch.nn.MSELoss()
     mean_loss = 0
     to_exit = False
     grad_mean = []
 
+    start_time = datetime.now()
     while step < max_steps and not to_exit:
-            print(f"EPOCH {epoch}:")
-            done = False
+            print_if_0_rank(f"EPOCH {epoch}:")
             for train_source, train_targets in train_loader:
                 train_targets = train_targets.reshape(-1, 1)
                 
@@ -454,25 +494,19 @@ def finetune_and_evaluate(model, accelerator, train_parameters, train_dataset, v
                     r2_train.update(output, train_targets)
                     mae_train.update(output, train_targets)
                     pearson_r_train.update(output, train_targets)
-
+                    del output
+                    del train_targets
                     optimizer.step()
+                    scheduler.step()
 
                     # To do every logging step.
                     # Note that the ``step`` variable indicates each iteration in the training loop, while for logging steps
                     # only steps which update the gradients are considered
                     if (step + 1) % (train_parameters["log_performance_every"]*train_parameters["gradient_accumulation_steps"]) == 0:
                         # Compute metrics for validation set if "validate_while_training" setting is enabled
-                        if ("validate_while_training" in train_parameters and train_parameters["validate_while_training"] and not "val_all" in train_parameters) or ("val_all" in train_parameters and not done):
-                            done = True
-                            cpu_model = copy.deepcopy(model).cpu()
-                            output = cpu_model(source1[0], source1[1])
-                            print(output.detach(), targets1.detach())
-                            eval_thread = threading.Thread(
-                                target=__in_train_evaluate_model__, 
-                                args=(cpu_model, val_loader, train_parameters, state, scaler, step+1)
-                            )
-                            eval_thread.start()
-                        
+                        if ("validate_while_training" in train_parameters and train_parameters["validate_while_training"]):
+                            __in_train_evaluate_model__(model, accelerator, val_dataset, state, scaler, step+1)
+ 
                         state["last_train_mae_score"] = state["train_mae_score"]
                         state["train_r2_score"] = r2_train.compute()
                         state["train_mae_score"] = mae_train.compute()
@@ -483,7 +517,8 @@ def finetune_and_evaluate(model, accelerator, train_parameters, train_dataset, v
 
                         # check whether division by gradient_steps is necessary or done automatically
                         mean_loss /= (train_parameters["log_performance_every"]*train_parameters["gradient_accumulation_steps"])
-                        print(f"Step {step + 1} - Loss: {mean_loss:.4f}, R2: {state['train_r2_score']:.4f}, MAE: {state['train_mae_score']:.4f}, Pearson R: {state['train_pearson_r_score']:.4f}")
+                        current_lr = optimizer.param_groups[0]["lr"]
+                        print_if_0_rank(f"Step {step + 1} - LR: {current_lr:.6f}, Loss: {mean_loss:.4f}, R2: {state['train_r2_score']:.4f}, MAE: {state['train_mae_score']:.4f}, Pearson R: {state['train_pearson_r_score']:.4f}")
                         
                         if "plot_grads" in train_parameters and train_parameters["plot_grads"]:
                             plt.yscale("log")
@@ -501,22 +536,41 @@ def finetune_and_evaluate(model, accelerator, train_parameters, train_dataset, v
                         break
             epoch+=1
 
-    __plot_metrics__(state)
-    scores = evaluate(model, val_dataset, scaler)
-    model = model.cpu()
-    #model, optimizer = accelerator.free_memory(model, optimizer)
-    
-    # Evaluate best model
-    print("Best R^2 recoded:", state["best_r2"])
-    best_scores = evaluate(state["best_model"], val_dataset, scaler)
-    save_finetuned_model(state["best_model"], train_parameters, train_dataset, val_dataset, scaler, suffix="_best")
-    
+    end_time = datetime.now()
+    elapsed_time = (end_time - start_time).total_seconds()
+    print_if_0_rank(f"Training took {elapsed_time:.2f} seconds")
+    if has_local:
+        torch.distributed.barrier()
+    if accelerator.is_main_process:
+        __plot_metrics__(state)
 
+    print_if_0_rank("\nTRAIN EVALUATION:")
+    train_scores = evaluate(model, accelerator, train_dataset, scaler)
+    print_if_0_rank(train_scores)
+    print_if_0_rank("\nVALIDATION EVALUATION:")
+    scores = evaluate(model, accelerator, val_dataset, scaler)
+
+    # Evaluate best model
+    print_if_0_rank("BEST MODEL EVALUATION:")
+    print_if_0_rank("Best R^2 recoded:", state["best_r2"])
+    best_scores = evaluate(state["best_model"], accelerator, val_dataset, scaler)
+    #save_finetuned_model(state["best_model"], train_parameters, train_dataset, val_dataset, scaler, suffix="_best")
+    
+    accelerator.free_memory(optimizer, train_loader)
+    accelerator.free_memory(scheduler)
+    best_model = copy.deepcopy(state["best_model"])
+    difference_train_validation = train_scores[0][1] - scores[0][1]
+
+    del state
     del train_dataset
     del val_dataset
+    del optimizer
+    del train_loader
+    del scheduler
+
     torch.cuda.empty_cache()
 
-    return scores, model
+    return scores, model, best_scores, best_model, difference_train_validation
 
 def __plot_metrics__(state):
     """
@@ -526,7 +580,6 @@ def __plot_metrics__(state):
         state (dict str -> float): state of the training process, used to memorize metrics and other important state variables
     """
     fig, axes = plt.subplots(1, 3, figsize=(18, 5))
-
     # Plot validation MAE
     axes[0].plot(state["val_maes"], label="Validation MAE")
     axes[0].set_title("Validation Mean Absolute Error (MAE)")
@@ -552,9 +605,13 @@ def __plot_metrics__(state):
 
     if not os.path.exists(PLOT_DIR):
         os.makedirs(PLOT_DIR)
-
+    
     current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
-    plt.savefig(f"{PLOT_DIR}/metricsplots_{current_time}.png")
+    fig_name = f"{PLOT_DIR}/metricsplots_{current_time}.png"
+    print(f"Saving plots to {fig_name}")
+    plt.savefig(fig_name)
+    plt.close(fig)
+    plt.close('all')
 
 def save_finetuned_model(finetune_model, train_parameters, train_dataset, val_dataset, scaler, suffix=""):
     """
@@ -566,6 +623,7 @@ def save_finetuned_model(finetune_model, train_parameters, train_dataset, val_da
             train_dataset (md.InterDataset): the train dataset used for finetuning.
             val_dataset (md.InterDataset): the validation dataset used for finetuning.
             scaler: scaler used for finetuning.
+            suffix (str): suffix to add to the folder name the model will be saved in.
     """
     current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
     save_folder = f"./saves/{current_time}{suffix}"
@@ -675,45 +733,77 @@ def __prepare_train_val_datasets__(drug_tokenizer, target_tokenizer, train_X, va
     return train_dataset, val_dataset
 
 
-def crossvalidate(X, y, n_split, train_parameters, scaler, classes, short_mode=False):
+def crossvalidate(X, y, n_split, train_parameters, scaler, classes, short_mode=False, path=None, use_best_scores=False):
     """
         Executes finetuning with crossvalidation.
 
         Parameters:
-            X (pandas.DataFrame): dataframe containing data used for prediction
-            y (List): list containing labels to predict for each interaction (dissociation constant)
-            n_split (int): number of cross validation folds to split the data into
-            train_parameters (dict str -> obj): training parameters
-            scaler: scaler to apply on labels
-            classes (List): classes by which to stratify the folds
-            short_mode (bool): if True, crossvalidation is not complete, meaning that only three rounds of crossvalidation are applied.
-                Default: False
+            X (pandas.DataFrame): DataFrame containing data used for prediction.
+            y (List): List containing labels to predict for each interaction (dissociation constant).
+            n_split (int): Number of splits for cross-validation.
+            train_parameters (dict): Dictionary containing training parameters.
+            scaler (object): Scaler object used for data normalization.
+            classes (List): List of class labels.
+            short_mode (bool): If True, crossvalidation is not complete, meaning that only half of crossvalidation rounds are applied. Default: False.
+            path (str, optional): Path to save the model. 
+                Default: None.
+            use_best_scores (bool): If True, use the best scores from the finetuning process. 
+                Default: False.
+
         Returns:
-            The mean, the minimum and maximum validation scores of the runs, for each metric.
+            The mean, the minimum and maximum validation scores of the runs, for each metric, and the mean difference between training and validation R2 scores.
     """
+    has_local = "LOCAL_RANK" in os.environ
     all_scores = dict()
     i = 0
+
+    differences = []
     for train_dataset, val_dataset in get_crossvalidate_datasets(X, y, n_split, scaler, classes):
-        accelerator, finetune_model = create_finetune_model(train_parameters)
-        scores, finetune_model = finetune_and_evaluate(finetune_model, accelerator, train_parameters, train_dataset, val_dataset, scaler)
-        del accelerator
-        del finetune_model
-        for score in scores:
-            if not score[0] in all_scores:
-                all_scores[score[0]] = []
+        if (not short_mode) or (short_mode and i < n_split//2):    
+            process = psutil.Process(os.getpid())  # Get current process
+            mem_info = process.memory_info()  # Get memory usage details
 
-            all_scores[score[0]].append(score[1])
+            print_if_0_rank(f"RAM Usage: {mem_info.rss / 1024 ** 2:.2f} MB")  # Convert bytes to MB
+            
+                
+            print_if_0_rank(f"Fold {i+1}: Creating finetuning_model...")
+            accelerator, finetune_model = create_finetune_model(train_parameters, path)
+            scores, finetune_model, best_scores, best_finetune_model, difference_train_validation = finetune_and_evaluate(finetune_model, accelerator, train_parameters, train_dataset, val_dataset, scaler)
+            differences.append(difference_train_validation)
+            print_if_0_rank(f"Fold {i+1}: Finished finetuning and evaluation.")
+            mem_info = process.memory_info()  # Get memory usage details
+            print_if_0_rank(f"RAM Before cleaning: {mem_info.rss / 1024 ** 2:.2f} MB")  # Convert bytes to MB
+            free_model(finetune_model, accelerator)
+            free_model(best_finetune_model, accelerator)
+            del accelerator
 
+            mem_info = process.memory_info()  # Get memory usage details
+            print_if_0_rank(f"RAM After cleaning: {mem_info.rss / 1024 ** 2:.2f} MB")  # Convert bytes to MB
+            # This doesn't clean anything
+            # There is a memory leak somewhere
+            if use_best_scores and best_scores[0][1] > scores[0][1]:
+                scores = best_scores
+
+            for score in scores:
+                if not score[0] in all_scores:
+                    all_scores[score[0]] = []
+
+                all_scores[score[0]].append(score[1])
+
+            if has_local:
+                torch.distributed.barrier()
+            gc.collect()
+            
         i+=1
-        if short_mode:
-            if i >= 3:
-                break
 
     result = dict()
     for (metric, scores) in all_scores.items():
         result[metric] = ((sum(scores)/len(scores)), min(scores), max(scores))
+    
+    if has_local:
+        torch.distributed.barrier()
 
-    return result
+    return result, np.mean(differences)
     
     
 
@@ -737,7 +827,6 @@ def get_crossvalidate_datasets(X, y, n_split, scaler, classes, plot=False):
     skf = StratifiedKFold(n_splits=n_split, shuffle=True)
     target_tokenizer, drug_tokenizer = __get_tokenizers__()
     for i, (train_index, val_index) in enumerate(skf.split(X, classes)):
-        print(f"Fold {i+1}:")
         train_X = X.iloc[train_index]
         val_X = X.iloc[val_index]
         train_y = y[train_index]
@@ -749,64 +838,72 @@ def get_crossvalidate_datasets(X, y, n_split, scaler, classes, plot=False):
         yield train_dataset, val_dataset
 
     
-def evaluate(model, val_dataset, scaler, metrics = [R2Score(), MeanAbsoluteError(), PearsonCorrCoef()], device = "cuda"):
+def evaluate(model, accelerator, dataset, scaler, metrics = [R2Score(), MeanAbsoluteError(), PearsonCorrCoef()]):
     """
-        Evaluates the model against a list of metric ``metrics``.
+        Evaluates the model on the specified dataset against a list of metric ``metrics``.
 
         Parameters:
             model: the model to evaluate
-            val_dataset (torch Dataset): Dataset containing validation examples
+            accelerator: transformers library accelerator
+            dataset (torch Dataset): Dataset containing the data to evaluate the model on
             scaler: Scaler used to scale targets, will be used to scale them back to normal during metric calculation
             metrics: a list of metrics the model will be evaluated against
                 Default: ``[R2Score(), MeanAbsoluteError(), PearsonCorrCoef()]``
-            device: device where the operations will be computed on
-                Default: "cuda"
 
             Returns:
                 A list of pairs with metrics and their corresponding scores
     """
 
-    # TODO: Device is not implemented
-    model = model.cpu()
+    for i in range(len(metrics)):
+        metrics[i].reset()
+        metrics[i] = accelerator.prepare(metrics[i])
+    
     model.eval()
 
-    for id in range(len(metrics)):
-        metrics[id] = metrics[id]
+    val_loader = DataLoader(dataset, shuffle=True)
+    print_if_0_rank("Number of validation data points:", len(val_loader))
 
-    val_loader = DataLoader(val_dataset, shuffle=True)
+    val_loader = accelerator.prepare(val_loader)    
 
     all_outputs = []
     all_targets = []
 
     with torch.no_grad():
         for source, targets in val_loader:
-                        
+            targets = targets.to(model.device)
             output = model(source[0], source[1])
             output = __unscale__(output, scaler)
             targets = __unscale__(targets, scaler)
             for metric in metrics:
                 metric.update(output, targets.reshape(-1,1))
-
             all_outputs.extend(output.cpu().numpy().ravel())
             all_targets.extend(targets.cpu().numpy().ravel())
-    #model = model.cpu()
-    all_pairs = zip(all_targets, all_outputs)
+    
+            del output
+            del targets
+
+    all_local_pairs = torch.tensor(list(zip(all_targets, all_outputs)), device=model.device)
+    all_pairs = accelerator.gather(all_local_pairs)
+    all_pairs = all_pairs.cpu().tolist()
+    
     all_pairs = sorted(all_pairs, key=lambda x: x[0])
+    print_if_0_rank("Len pair:", len(all_pairs))
     sorted_targets, sorted_outputs = zip(*all_pairs)
     sorted_targets = list(sorted_targets)
     sorted_outputs = list(sorted_outputs)
-
-    print("####### EVALUATION METRICS ########")
+    print_if_0_rank(len(sorted_targets), len(sorted_outputs))
+    print_if_0_rank("####### EVALUATION METRICS ########")
 
     scores = []
     for metric in metrics:
         metric_score = metric.compute()
         ig_, ax_ = metric.plot()
         metric_name = str(metric)[:-2]
-        scores.append((metric_name, metric_score))
+        scores.append((metric_name, metric_score.cpu()))
 
-        print(f"{metric_name}: {metric_score}")
-    
+        print_if_0_rank(f"{metric_name}: {metric_score}")
+        plt.close(ig_)
+
     plt.clf()  # Clears the current figure
     plt.plot(sorted_outputs, sorted_targets, 'o', label="Model Predictions")
     # Plot the red semi-transparent line
@@ -824,7 +921,7 @@ def evaluate(model, val_dataset, scaler, metrics = [R2Score(), MeanAbsoluteError
     fig = plt.gcf()  # Get the current figure
     current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
     fig.savefig(f"{PLOT_DIR}/calibration_{current_time}.png")
-    
+    plt.close(fig)
     return scores
 
 def __get_tokenizers__():
@@ -839,7 +936,7 @@ def __get_tokenizers__():
 
     return target_tokenizer, drug_tokenizer
 
-def load_RNABERTa(hidden_size=512, num_hidden_layers=12, num_attention_heads=12):
+def load_RNABERTa(hidden_size=512, num_hidden_layers=12, num_attention_heads=16):
     """
         Initializes a RoBERTa target encoder given the hidden size, number of hidden layers and number of attention heads.
         This method should be employed only for finetuning, since it does not apply muParametrization.
@@ -850,7 +947,7 @@ def load_RNABERTa(hidden_size=512, num_hidden_layers=12, num_attention_heads=12)
             num_hidden_layers (int): number of hidden layers in the model
                 Default: 12
             num_attention_heads (int): number of attention heads in the model
-                Default: 12
+                Default: 16
         Returns:
             the target encoder.
     """
@@ -867,67 +964,70 @@ def load_RNABERTa(hidden_size=512, num_hidden_layers=12, num_attention_heads=12)
     target_encoder = RobertaForMaskedLM(configuration)
     return target_encoder    
 
-def create_finetune_model(train_parameters, from_pretrained=None):
+def create_finetune_model(train_parameters, path, from_pretrained=None):
     """
-        Load the pretrained models and prepare them for finetuning.
-        LoRA is prepared for finetuning and LoftQ is applied for the target encoder.
+            Load the pretrained models and prepare them for finetuning.
+            LoRA is prepared for finetuning and LoftQ is applied for the target encoder.
 
-        Parameters:
-            train_parameters (dict str -> obj): training parameters
-            from_pretrained (str): path of the pretrained model to load, if available. If not, create a new model. 
-                Default: None
-        Returns:
-            a transformers accelerator and the model to be trained.
+            Parameters:
+                train_parameters (dict str -> obj): training parameters
+                path (str): path to the pretrained model
+                from_pretrained (str): path of the pretrained model to load, if available. If not, create a new model. 
+                    Default: None
+            Returns:
+                a transformers accelerator and the model to be trained.
 
     """
-    torch.cuda.empty_cache()
-
-    drug_encoder = AutoModel.from_pretrained("DeepChem/ChemBERTa-77M-MTR", output_hidden_states=True)
-    target_encoder = load_RNABERTa(train_parameters["hidden_size"], train_parameters["hidden_layers"], train_parameters["num_attention_heads"])
-
-    loftq_config = LoftQConfig(loftq_bits=8)           
-    lora_config_target = LoraConfig(r=train_parameters["lora_r"],
-                                lora_alpha=train_parameters["lora_alpha"], 
-                                use_rslora=True, 
-                                bias="none",
-                                target_modules=["query", "key", "value", "dense"],
-                                init_lora_weights="loftq", 
-                                loftq_config=loftq_config,
-                                task_type=TaskType.FEATURE_EXTRACTION,
-                                lora_dropout=train_parameters["lora_dropout"])
-    
-    # Could add quantization for this too
-    lora_config_drug = LoraConfig(r=train_parameters["lora_r"],
-                                lora_alpha=train_parameters["lora_alpha"], 
-                                use_rslora=True, 
-                                bias="none",
-                                target_modules=["query", "key", "value", "dense"],
-                                task_type=TaskType.FEATURE_EXTRACTION,
-                                lora_dropout=train_parameters["lora_dropout"])
-        
-    target_encoder = get_peft_model(target_encoder, lora_config_target)
-    drug_encoder = get_peft_model(drug_encoder, lora_config_drug)
 
     torch.cuda.empty_cache()
 
-    print_trainable_parameters("Target encoder:", target_encoder)
-    print_trainable_parameters("Drug encoder:", drug_encoder)
+    drug_encoder = AutoModel.from_pretrained("DeepChem/ChemBERTa-77M-MTR")
+    target_encoder = RobertaForMaskedLM.from_pretrained(path).roberta
+
+    print("Models loaded!")
+    torch.cuda.empty_cache()
+
+
+    #print_trainable_parameters("Target encoder:", target_encoder)
+    #print_trainable_parameters("Drug encoder:", drug_encoder)
 
     if not from_pretrained:
         config = md.InteractionModelATTNConfig(train_parameters["model_dropout"])
         model = md.InteractionModelATTNForRegression(config, target_encoder, drug_encoder)
+
     else:
         model = md.InteractionModelATTNForRegression.from_pretrained(from_pretrained, target_encoder, drug_encoder)
-
     deepspeed_plugin = None
-    # This makes everything crash during cross_validation for some reason
-    # To reproduce, move deepspeed_plugin + accelerator lines before model loading
-    # Maybe conflict between LoftQ quantization and deepspeed moving everything to CPU
-    #deepspeed_plugin = DeepSpeedPlugin(hf_ds_config="ds_config.json")
-    accelerator = Accelerator(deepspeed_plugin=deepspeed_plugin, gradient_accumulation_steps=train_parameters["gradient_accumulation_steps"], mixed_precision="bf16")
+
+    kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+    accelerator = Accelerator(deepspeed_plugin=deepspeed_plugin, gradient_accumulation_steps=train_parameters["gradient_accumulation_steps"], 
+                              kwargs_handlers=[kwargs])
 
     return accelerator, model
 
+def free_model(model, accelerator=None):
+    """
+        Frees the model from GPU and RAM memory.
+    """
+    
+    for parameters in model.parameters():
+        parameters.grad = None
+        del parameters
+
+    if hasattr(model, "module"):
+        model = model.module 
+        
+    if accelerator:
+        accelerator.free_memory(model)
+
+    del model.model.target_encoder
+    del model.model.drug_encoder
+    del model.model
+    del model
+
+    torch.cuda.empty_cache()
+    gc.collect()
+    
 def make_bsh(filename=None):
     """
         Creates the base shapes for the model to allow MuParametrization.
@@ -956,45 +1056,78 @@ def make_bsh(filename=None):
     base_shapes = make_base_shapes(base_model, delta_model, savefile=filename)
     return base_shapes
 
-def finetune_objective(trial, X, y, n_split, scaler, classes, short_mode):
-    """
-        Objective function for the Optuna optimization of the finetuning hyperparameters.
-        
-        Parameters:
-            trial: Optuna trial object
-            X (pandas.DataFrame): dataframe containing data used for prediction
-            y (List): list containing labels to predict for each interaction (dissociation constant)
-            n_split (int): number of cross validation folds to split the data into
-            scaler: scaler to apply on labels
-            classes (List): classes by which to stratify the folds.
-            short_mode (bool): if True, crossvalidation is not complete, meaning that only three rounds of crossvalidation are applied.
-                Default: False
-    """
+def finetune_objective(trial, X, y, n_split, scaler, classes, short_mode, path):
+    
+    has_local = "LOCAL_RANK" in os.environ
+    
+    rank = int(os.getenv("RANK", 0))
+    world_size = int(os.getenv("WORLD_SIZE", 1))  # Assuming world size defaults to 1
+
     train_parameters = {
-        "train_batch_size": 16,
+        "train_batch_size": 32//world_size,
         "device": "cuda",
-        "gradient_accumulation_steps":trial.suggest_categorical("gradient_accumulation_steps", [1, 2]),}
+        "validate_while_training": True,
+        "gradient_accumulation_steps": 1,
+    }
 
     gas = train_parameters["gradient_accumulation_steps"]
+    # Let rank 0 suggest the hyperparameters and then broadcast them.
+    if rank == 0:
+        suggested_learning_rate = trial.suggest_float("learning_rate", 4e-6, 5e-4, log=True) * np.sqrt(gas * train_parameters["train_batch_size"]*world_size)
+        suggested_weight_decay = trial.suggest_float("weight_decay", 1e-3, 1e-1, log=True)
+        suggested_model_dropout = trial.suggest_categorical("model_dropout", [0.1, 0.2, 0.3, 0.4, 0.5])
+        suggested_num_cycles = trial.suggest_categorical("num_cycles", [0, 1/6, 0.25])
 
+        print_if_0_rank(f"Suggested learning rate: {suggested_learning_rate}\nSuggested weight decay: {suggested_weight_decay}\nSuggested model dropout: {suggested_model_dropout}\nSuggested num cycles: {suggested_num_cycles}")
+        # Pack all suggestions into a dictionary
+        hyperparams = {
+            "learning_rate": suggested_learning_rate,
+            "weight_decay": suggested_weight_decay,
+            "model_dropout": suggested_model_dropout,
+            "num_cycles": suggested_num_cycles
+        }
+    else:
+        hyperparams = {}
+    
+    # Synchronize all processes here so that rank 0 has finished suggestion.
+    if has_local:
+        torch.distributed.barrier()
+    # Broadcast the hyperparameters dictionary from rank 0 to all other processes.
+    # Note: Broadcasting a Python object can be done with torch.distributed.broadcast_object_list.
+    if has_local:
+        hyperparams_list = [hyperparams]
+        torch.distributed.broadcast_object_list(hyperparams_list, src=0)
+        print("WE ARE ALL HERE")
+        hyperparams = hyperparams_list[0]
+    
+    print("Preparing parameters...")
+    # Now update your train_parameters using the received hyperparams.
+    train_parameters = {
+        "train_batch_size": 32//world_size,
+        "device": "cuda",
+        "validate_while_training": True,
+        "gradient_accumulation_steps": 1,
+    }
     train_parameters.update({
-                        "learning_rate": trial.suggest_float("learning_rate", 2e-6, 2e-4, log=True)*np.sqrt(gas*train_parameters["train_batch_size"]),
-                        "adam_epsilon": 1e-6,
-                        "num_epochs":200,
-                        "log_performance_every":5,
-                        "weight_decay": trial.suggest_float("weight_decay", 1e-3, 1e-1, log=True),
-                        "model_dropout": trial.suggest_float("model_dropout", 0.1, 0.5),
-                        "lora_r": trial.suggest_categorical("lora_r", [4, 8, 16, 32]),
-                        "lora_alpha": trial.suggest_categorical("lora_alpha", [4, 8, 16, 32, 64]),
-                        "lora_dropout":trial.suggest_float("lora_dropout", 0, 0.5),
-                        "max_norm":1,
-                        })
+        "learning_rate": hyperparams["learning_rate"],
+        "adam_epsilon": 1e-6,
+        "num_epochs": 50,
+        "log_performance_every": 40,
+        "weight_decay": hyperparams["weight_decay"],
+        "model_dropout": hyperparams["model_dropout"],
+        "max_norm": 1,
+        "num_cycles": hyperparams["num_cycles"]
+    })
 
-    results = crossvalidate(X, y, n_split, train_parameters, scaler, classes, short_mode)
-    return np.mean(results["R2Score"][:2])
+    results, difference = crossvalidate(X, y, n_split, train_parameters, scaler, classes, short_mode, path=path)
 
 
-def finetune_optimize(X, y, n_split, scaler, classes, short_mode):
+    plt.close('all')  # Close all open figures
+    gc.collect()  # Force garbage collection
+    return np.mean(results["R2Score"][:2]), np.mean([results["MeanAbsoluteError"][0], results["MeanAbsoluteError"][2]]), difference
+
+
+def finetune_optimize(X, y, n_split, scaler, classes, short_mode, path=None):
     """
         Use Optuna TPESampler to optimize finetuning parameters.
         
@@ -1004,50 +1137,72 @@ def finetune_optimize(X, y, n_split, scaler, classes, short_mode):
             n_split (int): number of cross validation folds to split the data into
             scaler: scaler to apply on labels
             classes (List): classes by which to stratify the folds.
+            short_mode (bool): if True, crossvalidation is not complete, meaning that only half of crossvalidation rounds are applied.
+                Default: False
+            path (str): path to the pretrained model
+                Default: None
         Returns:
             The best hyperparameters found by the optimization.
     """
-    torch.distributed.init_process_group(backend="nccl", init_method="env://")
-    rank = int(os.environ["RANK"])
-    world_size = os.environ["WORLD_SIZE"]
-
+    n_trials = 50
+    has_local = "LOCAL_RANK" in os.environ 
+    local_rank = int(os.getenv("LOCAL_RANK", 0))
+    rank = int(os.getenv("RANK", 0))
+    world_size = int(os.getenv("WORLD_SIZE", 1))  # Assuming world size defaults to 1
+    if has_local:
+        torch.distributed.init_process_group(backend="nccl", init_method="env://")
+        torch.cuda.set_device(local_rank)
     print_if_0_rank("WORLD SIZE:", world_size)
 
     now = datetime.now().strftime('%Y%m%d_%H%M%S')
     result_path = f"study_results/{now}"
-
-    storage = "sqlite:///finetuning.db"
+    
+    storage = f"sqlite:///finetuning_{now}.db"
 
     if rank == 0:
         if not os.path.exists(result_path):
             os.makedirs(result_path)
-    
         study = optuna.create_study(
-            direction="maximize",
-            sampler=optuna.samplers.TPESampler(seed=(rank+1)*14),
+            directions=["maximize", "minimize", "minimize"],
+            sampler=optuna.samplers.TPESampler(seed=(world_size+1)*14),
             study_name="finetuning_parameter_selection",
             load_if_exists=True,
             storage=storage)
-    
+        print("Starting optimization...")
+
+    if has_local:
+        torch.distributed.barrier()  # Ensure rank 0 finishes creating the study
+
+    #study = optuna.load_study(
+    #    study_name="finetuning_parameter_selection",
+    #    storage=storage
+    #)
+
+    if has_local:
+        torch.distributed.barrier()  # Optional: synchronize after loading the study
+
+    #os.environ["CUDA_VISIBLE_DEVICES"] = str(local_rank)
+    print("Starting optimization...")
+    if rank == 0:
+        study.optimize(lambda trial: finetune_objective(trial, X, y, n_split, scaler, classes, short_mode, path), n_trials=n_trials, n_jobs=1)
     else:
-        study = optuna.load_study(
-            study_name="finetuning_parameter_selection",
-            storage=storage
-        )
-
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(rank)
-
-    study.optimize(lambda trial: finetune_objective(trial, X, y, n_split, scaler, classes, short_mode), n_trials=100//world_size, n_jobs=1)
-    torch.distributed.barrier()
+        for i in range(n_trials):
+            finetune_objective(0, X, y, n_split, scaler, classes, short_mode, path)
+    if has_local:
+        torch.distributed.barrier()
 
     if rank == 0:
-        save_study_plot(study, result_path)
-
+        save_study_plot(study, result_path, True)
+        
         with open(f"{result_path}/finetune_best_params.txt", "w") as f:
-            for key, value in study.best_params.items():
-                f.write(f"{key}: {value}\n")
+            for trial in study.best_trials:
+                f.write(f"Trial number: {trial.number}\n")
+                for key, value in trial.params.items():
+                    f.write(f"{key}: {value}\n")
+                f.write("\n")
 
-    return study.best_params
+    if has_local:
+        torch.distributed.destroy_process_group()
 
 
 def optuna_hp_space(trial):
@@ -1060,12 +1215,12 @@ def optuna_hp_space(trial):
             A dictionary containing the hyperparameters to optimize.
     """
     train_parameters = {
-        "learning_rate": trial.suggest_float("learning_rate", 1e-4, 5e-2, log=True),
-        "warmup_ratio": trial.suggest_float("warmup_ratio", 0.01, 0.1),
+        "learning_rate": trial.suggest_float("learning_rate", 1e-4, 5e-3, log=True),
+        "warmup_ratio": trial.suggest_float("warmup_ratio", 0.01, 0.2),
     }
     return train_parameters
 
-def model_init(trial, full=False):
+def pretraining_model_init(trial, full=False):
     """
         Helper function passed to the MuTrainer to initialize a new model.
         
@@ -1097,6 +1252,8 @@ def model_init(trial, full=False):
     target_model = mu.RobertaForMaskedLM(config=target_config)
     print(f"Number of parameters in target_model: {sum(p.numel() for p in target_model.parameters())}")
     set_base_shapes(target_model, "roberta512.bsh")
+
+    target_model.apply(target_model._init_weights)
     return target_model
 
 def compute_objective(metrics):
@@ -1118,8 +1275,10 @@ def pretrain_optimize(path):
         Parameters:
             path: path where to save or load the tokenized pretraining datasets.
     """
+    
     torch.distributed.init_process_group(backend="nccl", init_method="env://")
-    rank = int(os.environ["RANK"])
+    rank = int(os.getenv("RANK", 0))
+
     target_tokenizer, _ = __get_tokenizers__()
 
     now = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -1141,7 +1300,6 @@ def pretrain_optimize(path):
         '--output_dir', 'tmp',
         '--logging_steps', '200',
         '--save_strategy', 'no',
-        '--max_grad_norm', '10.0',
         '--per_device_eval_batch_size', '64',
         '--per_device_train_batch_size', '32',
         '--gradient_accumulation_steps', str(8//int(os.environ["WORLD_SIZE"])),
@@ -1154,12 +1312,14 @@ def pretrain_optimize(path):
         '--ddp_find_unused_parameters', 'False'
     ])
 
+    init = lambda x: pretraining_model_init(x, False)
+
     trainer = MuTrainer(
         model=None,
         args=training_args,
         train_dataset=datasets["train"],
         eval_dataset=datasets["val"],
-        model_init=model_init,
+        model_init=init,
         data_collator=data_collator
     )
 
@@ -1176,27 +1336,68 @@ def pretrain_optimize(path):
 
         optuna.delete_study(study_name="pretraining_parameter_selection", storage=storage)
 
-def save_study_plot(study, path):
+def save_study_plot(study, path, is_multiobjective=False):
     """
-        Saves a series of plots from the Optuna study.
-    
-        Parameters:
-            study: Optuna study object
-            path (str): path where to save the plots
+    Saves a series of plots from the Optuna study.
+
+    For single-objective studies, the following plots are saved:
+        - Parameter Importances
+        - Parallel Coordinate
+        - Contour
+        - Slice
+
+    For multiobjective studies, a Pareto front plot is saved and parameter
+    importances and contour plots are computed separately for each objective.
+
+    Parameters:
+        study: Optuna study object
+        path (str): path where to save the plots
+        is_multiobjective (bool): Flag indicating if the study is multi-objective
+            Default: False
+
+    Assumes that in a multiobjective study the first metric is "R2score"
+    and the second metric is "MAE".
     """
-    fig = optuna.visualization.plot_param_importances(study)
-    fig.update_layout(width=800, height=800)
-    fig.write_image(f"{path}/param_importances.png")
+    if is_multiobjective:
+        # Define metric names based on the order of objectives.
+        metric_names = ["R2score", "MAE", "R2Difference"]
 
-    fig = optuna.visualization.plot_parallel_coordinate(study)
-    fig.update_layout(width=800, height=800)
-    fig.write_image(f"{path}/parallel_coordinate.png")
+        # Plot and save the Pareto front.
+        fig = optuna.visualization.plot_pareto_front(study, target_names=metric_names)
+        fig.update_layout(width=1400, height=1300)
+        fig.write_image(f"{path}/pareto_front.png")
 
-    fig = optuna.visualization.plot_contour(study)
-    fig.update_layout(width=800, height=800)
-    fig.write_image(f"{path}/contour.png")
+        # Plot parameter importances and contour plots for each metric.
+        for i, metric_name in enumerate(metric_names):
+            # Parameter importances plot for the metric.
+            fig = optuna.visualization.plot_param_importances(
+                study, target=lambda t, i=i: t.values[i], target_name=metric_name
+            )
+            fig.update_layout(width=800, height=800)
+            fig.write_image(f"{path}/param_importances_{metric_name}.png")
 
-    fig = optuna.visualization.plot_slice(study)
-    fig.update_layout(width=800, height=800)
-    fig.write_image(f"{path}/slice.png")
-    
+            # Contour plot for the metric.
+            fig = optuna.visualization.plot_contour(
+                study, target=lambda t, i=i: t.values[i], target_name=metric_name
+            )
+            fig.update_layout(width=1600, height=1600)
+            fig.write_image(f"{path}/contour_{metric_name}.png")
+    else:
+        # Single-objective plots
+        fig = optuna.visualization.plot_param_importances(study)
+        fig.update_layout(width=800, height=800)
+        fig.write_image(f"{path}/param_importances.png")
+
+        fig = optuna.visualization.plot_parallel_coordinate(study)
+        fig.update_layout(width=800, height=800)
+        fig.write_image(f"{path}/parallel_coordinate.png")
+
+        fig = optuna.visualization.plot_contour(study)
+        fig.update_layout(width=800, height=800)
+        fig.write_image(f"{path}/contour.png")
+
+        fig = optuna.visualization.plot_slice(study)
+        fig.update_layout(width=800, height=800)
+        fig.write_image(f"{path}/slice.png")
+
+    print(f"Study plots saved in {path}!")

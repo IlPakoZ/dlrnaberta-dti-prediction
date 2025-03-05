@@ -172,7 +172,52 @@ def create_pretraining_files(directory, blast_results_file="./processed/blast_re
             # Removes uncompressed file
             Path.unlink(save_to)
 
-    __split_train_test__("./processed/fastas/", proportion_train)
+    #__split_train_test__("./processed/fastas/", proportion_train)
+
+def encode_interaction_inputs(path):
+    inters = pd.read_csv(f"{path}/processed/interactions/all.csv")
+    pretrained_model_path = f"{path}/pretrained"
+    X_smiles = inters["SMILES"]
+    X_targets = inters["Target_RNA_sequence"]
+
+    from transformers import RobertaForMaskedLM, AutoModel
+    import train
+    import torch
+    from tqdm import tqdm
+    import h5py 
+       
+    target_encoder = RobertaForMaskedLM.from_pretrained(pretrained_model_path, output_hidden_states=True).to("cuda")
+    drug_encoder = AutoModel.from_pretrained("DeepChem/ChemBERTa-77M-MTR", output_hidden_states=True).to("cuda")
+
+    target_tokenizer, drug_tokenizer = train.__get_tokenizers__()
+    with torch.no_grad():
+        encoded_targets = []
+        encoded_drugs = []
+        masks = []
+
+        for x1, x2 in tqdm(zip(X_targets, X_smiles)):
+            smiles = drug_tokenizer(x1,
+                                    padding="max_length", 
+                                    truncation=True, 
+                                    max_length=512,
+                                    return_tensors="pt").to("cuda")
+            targets = target_tokenizer(x2,
+                                    padding="max_length", 
+                                    truncation=True, 
+                                    max_length=512,
+                                    return_tensors="pt").to("cuda")
+            
+            encoded_target = target_encoder(**targets).hidden_states[-1]
+            encoded_drug = drug_encoder(**smiles).hidden_states[-1]
+
+            encoded_targets.append(encoded_target.cpu().numpy())
+            encoded_drugs.append(encoded_drug.cpu().numpy())
+            masks.append(smiles["attention_mask"].cpu().numpy())
+
+    with h5py.File(f"{path}/processed/interactions/all_encoded.h5", 'w') as f:
+        f.create_dataset(f'Target_RNA_sequence', data=encoded_targets)
+        f.create_dataset(f'SMILES', data=encoded_drugs)
+        f.create_dataset(f'attention_mask', data=masks)
 
 def __split_train_test__(processed_fastas_directory, proportion_train):
     """
@@ -235,7 +280,7 @@ def __split_train_test__(processed_fastas_directory, proportion_train):
                         splt = shuffled[i].split(",")
                         fwt.write(splt[1])
                         fwd.write(f"{splt[0]},{file}\n")
-                        
+
 def create_finetuning_files(interactions_path):
     """
         Processes the raw interactions. It saves a new file for each target category and a file containing each category
@@ -258,5 +303,3 @@ def create_finetuning_files(interactions_path):
 
     excel[col_names+["Category"]].to_csv("./processed/interactions/all.csv", index = False)
 
-#create_finetuning_files("./raw/interactions/smilies_xlsx.xlsx")
-#__split_train_test__("./processed/fastas", proportion_train=0.9)

@@ -34,8 +34,59 @@ class InteractionModelATTN(nn.Module):
         super().__init__()
         self.target_encoder = target_encoder
         self.drug_encoder = drug_encoder
-        self.lin_map = nn.Linear(512, 384)
-        self.dropout_map = nn.Dropout(dropout)
+        self.lin_map_target = nn.Linear(512, 384)
+        self.dropout_map_target = nn.Dropout(dropout)
+
+        self.lin_map_drug = nn.Linear(384, 384)
+        self.dropout_map_drug = nn.Dropout(dropout)
+
+        self.multihead_attention = nn.MultiheadAttention(384, num_heads, dropout = dropout, batch_first=True)
+        self.conv = nn.Conv1d(in_channels=384, out_channels=1, kernel_size=1)
+        self.dropout = nn.Dropout(dropout)
+
+        self.norm1 = nn.LayerNorm(384)                          # For attention output
+        self.gelu = nn.GELU()
+        self.batch_norm = nn.BatchNorm1d(1)
+        self.process = nn.Linear(512, 512)
+
+        self.output = nn.Linear(512, 1)
+
+        
+    def forward(self, x1, x2):
+        y1 = self.target_encoder(**x1).last_hidden_state      # The target
+        y2 = self.drug_encoder(**x2).last_hidden_state        # The drug
+
+        y1 = self.lin_map_target(y1)
+        y1 = self.dropout_map_target(y1)
+
+        y2 = self.lin_map_drug(y2)
+        y2 = self.dropout_map_drug(y2)
+
+        #key_padding_mask = torch.squeeze(x2["attention_mask"], axis=1).bool() # This doesn't work in multihead_attention
+        out, _ = self.multihead_attention(y1, y2, y1, key_padding_mask=torch.squeeze(x2["attention_mask"].float(), axis=1))
+        out = self.norm1(self.dropout(out))
+
+        out = out.transpose(1, 2)   # Now shape becomes torch.Size([X, 384, 512])
+        out = self.conv(out).squeeze(1)
+        
+        out = self.batch_norm(out.unsqueeze(1)).squeeze(1)
+        out = self.gelu(out)
+        out = self.gelu(self.process(out))
+        out = self.output(out)
+
+        return out
+    
+"""
+class InteractionModelATTN(nn.Module):
+    def __init__(self, target_encoder, drug_encoder, dropout, num_heads=1):
+        super().__init__()
+        self.target_encoder = target_encoder
+        self.drug_encoder = drug_encoder
+        self.lin_map_target = nn.Linear(512, 384)
+        self.dropout_map_target = nn.Dropout(dropout)
+
+        self.lin_map_drug = nn.Linear(384, 384)
+        self.dropout_map_drug = nn.Dropout(dropout)
 
         self.multihead_attention = nn.MultiheadAttention(384, num_heads, dropout = dropout, batch_first=True)
         self.conv = nn.Conv1d(in_channels=512, out_channels=1, kernel_size=1)
@@ -53,8 +104,11 @@ class InteractionModelATTN(nn.Module):
         y1 = self.target_encoder(**x1).hidden_states[-1]       # The target
         y2 = self.drug_encoder(**x2).hidden_states[-1]         # The drug
 
-        y1 = self.lin_map(y1)
-        y1 = self.dropout_map(y1)
+        y1 = self.lin_map_target(y1)
+        y1 = self.dropout_map_target(y1)
+
+        y2 = self.lin_map_drug(y2)
+        y2 = self.dropout_map_drug(y2)
 
         key_padding_mask = torch.squeeze(x2["attention_mask"], axis=1).bool() # This doesn't work in multihead_attention
         out, _ = self.multihead_attention(y1, y2, y1, key_padding_mask=torch.squeeze(x2["attention_mask"].float(), axis=1))
@@ -72,7 +126,7 @@ class InteractionModelATTN(nn.Module):
         out = self.output(out)
 
         return out
-    
+"""
 class MuTrainer(Trainer):
 
     def create_optimizer_and_scheduler(self, num_training_steps: int):
@@ -84,7 +138,7 @@ class MuTrainer(Trainer):
             optimizer = self.optimizer.optimizer
         else:
             optimizer = self.optimizer
-        self.scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=self.args.warmup_ratio*num_training_steps, num_training_steps=num_training_steps, num_cycles=0.41)
+        self.lr_scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=self.args.warmup_ratio*num_training_steps, num_training_steps=num_training_steps, num_cycles=0.41)
 
 class InterDataset(Dataset):
     def __init__(self, targets, smiles, pkd=None):
