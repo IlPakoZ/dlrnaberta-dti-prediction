@@ -133,30 +133,6 @@ def __in_train_evaluate_model__(model, accelerator, val_dataset, state, thread_i
         del pearson_r_metric
         print_if_0_rank(f"Epoch {thread_id} - R2 val: {state['valid_r2_score']:.4f}, MAE val: {state['valid_mae_score']:.4f}, Pearson R val: {state['valid_pearson_r_score']:.4f}")
         
-
-def __check_mae_score_exit__(train_parameters, counter, train=True):
-    """
-        Checks whether the mae score has converged. If the  ``counter`` is greater then 5, then the loss
-        is stable and training is considered complete.
-
-        Parameters:
-            train_parameters (dict str -> obj): training parameters
-            counter (int): number of consecutive logging steps in which loss hasn't decreased
-            train (bool): whether we are checking the train mae. If ``False``, validation mae is checked instead.
-                Default: ``True``
-
-        Return:
-            ``True`` if the mae score converged, ``False`` otherwise.
-    """
-    if train:
-        check = "exit_if_train_mae_converges"
-    else:
-        check = "exit_if_valid_mae_converges"
-
-    if check in train_parameters:
-        if counter >= 5:
-            return True
-    return False 
     
 # https://huggingface.co/docs/peft/main/en/task_guides/semantic_segmentation_lora
 def print_trainable_parameters(name, model):
@@ -176,39 +152,6 @@ def print_trainable_parameters(name, model):
     print(
         f"{name} trainable params: {trainable_params} || all params: {all_param} || trainable%: {100 * trainable_params / all_param:.2f}"
     )
-
-
-def __update_exit_conditions__(mean_loss, train_parameters, state):
-    """
-        Checks the additional exit conditions. Returns ``True`` if the training process is finished.
-
-        Parameters:
-            mean_loss (float): mean training loss.
-            train_parameters (dict str -> obj): training parameters
-            state (dict str -> float): state of the training process, used to memorize metrics and other important state variables
-
-        Returns:
-            ``True`` if the training process is completed, ``False`` otherwise.
-    """
-    to_exit = False
-    if "exit_if_train_loss_less_than_or_converges" in train_parameters:
-        if mean_loss < train_parameters["exit_if_train_loss_less_than_or_converges"]:
-            to_exit = True
-
-        if (state["train_mae_score"] <= (state["last_train_mae_score"]+0.005)):
-            state["counter_train"] += 1
-        else:
-            state["counter_train"] = 0
-
-    if ("exit_if_valid_mae_converges" in train_parameters) and ("validate_while_training" in train_parameters) and train_parameters["validate_while_training"]:
-        if (state["valid_mae_score"] <= (state["last_valid_mae_score"]+0.005)):
-            state["counter_valid"] += 1
-        else:
-            state["counter_valid"] = 0
-    
-    to_exit = to_exit or __check_mae_score_exit__(train_parameters, state["counter_valid"], True) or __check_mae_score_exit__(train_parameters, state["counter_valid"], False)
-
-    return to_exit
 
 def tokenize_function(tokenizer, examples):
     return tokenizer(examples["text"], padding="max_length", truncation=True, max_length=512, return_tensors="pt")
@@ -381,6 +324,39 @@ def split(inters, X, y, train_size, random_state):
 
 
 def finetune_and_evaluate(model, accelerator, train_parameters, train_dataset, val_dataset, save_result=False):
+    """
+    Fine-tunes the interaction model and evaluates performance on training and validation datasets.
+
+    Trains the model for a specified number of epochs, logging training metrics (R², MAE, Pearson R),
+    optionally validating during training, plotting gradient norms in debug mode, and saving the final model.
+
+    Parameters:
+        model (nn.Module): The interaction model to fine-tune.
+        accelerator (Accelerator): HuggingFace Accelerator for distributed or mixed‐precision training.
+        train_parameters (dict): Training configuration, must include:
+            - "num_epochs" (int): Number of training epochs.
+            - "learning_rate" (float): Optimizer learning rate.
+            - "weight_decay" (float): Optimizer weight decay.
+            - "train_batch_size" (int): Batch size for training.
+            - "gradient_accumulation_steps" (int): Steps to accumulate gradients before optimizer step.
+            - Optional "decay_ratio" (float): If <0.99, used to schedule learning‐rate decay.
+            - Optional "target_epochs" (int): Epoch count at which decay calculation is anchored.
+            - Optional "validate_while_training" (bool): If True, runs validation at end of each epoch.
+            - Optional "debug" (bool): If True, plots per‐parameter gradient norms each epoch.
+        train_dataset (InterDataset): Dataset for training.
+        val_dataset (InterDataset): Dataset for validation.
+        save_result (bool): If True and on main process, saves the fine‐tuned model after training.
+            Default: False
+
+    Returns:
+        tuple:
+            - scores (tuple): Evaluation metrics (R², MAE, Pearson R) on the validation or training set.
+            - model (nn.Module): The fine‐tuned model instance.
+            - None: Placeholder for backward‐compatibility.
+            - None: Placeholder for backward‐compatibility.
+            - float: Difference between validation MAE and training MAE (validation minus training).
+    """
+        
     has_local = "LOCAL_RANK" in os.environ
     r2_train = R2Score()
     mae_train = MeanAbsoluteError()
@@ -424,7 +400,7 @@ def finetune_and_evaluate(model, accelerator, train_parameters, train_dataset, v
                 
             with accelerator.accumulate(model):
                 output = model(train_source[0], train_source[1])
-                    
+         
                 loss = criterion(output, train_targets, weight=train_source[2].reshape(-1, 1))
 
                 mean_loss+=loss.item()
@@ -456,7 +432,7 @@ def finetune_and_evaluate(model, accelerator, train_parameters, train_dataset, v
 
                 steps += 1
 
-                    
+  
         mean_loss = mean_loss/steps 
         current_lr = optimizer.param_groups[0]["lr"]
 
@@ -580,7 +556,6 @@ def save_finetuned_model(finetune_model, train_parameters, train_dataset, val_da
             train_parameters (dict str -> obj): training parameters
             train_dataset (md.InterDataset): the train dataset used for finetuning.
             val_dataset (md.InterDataset): the validation dataset used for finetuning.
-            scaler: scaler used for finetuning.
             suffix (str): suffix to add to the folder name the model will be saved in.
     """
     current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -723,7 +698,10 @@ def __prepare_train_val_datasets__(drug_tokenizer, target_tokenizer, train_X, va
             val_X (pandas.DataFrame): dataframe containing validation data used for performance evaluation
             train_y (List): list containing training labels to predict (dissociation constant)
             val_y (List): list containing validation labels to evaluate model (dissociation constant)
+            scaler (object): Scaler object used for data normalization.
             plot (bool): if ``True``, plots an histogram of the training and validation data distribution, binned by label value
+                Default: ``False``
+            weights (List[int]): Class labels for each training example, used to compute balanced sample weights.
                 Default: ``False``
 
         Returns:
@@ -810,9 +788,11 @@ def crossvalidate(X, y, n_split, train_parameters, scaler, classes, short_mode=F
             classes (List): List of class labels.
             short_mode (bool): If True, crossvalidation is not complete, meaning that only half of crossvalidation rounds are applied. Default: False.
             path (str, optional): Path to save the model. 
-                Default: None.
+                Default: ``None``.
             use_best_scores (bool): If True, use the best scores from the finetuning process. 
-                Default: False.
+                Default: ``False``.
+            compute_weights (bool): If True, compute class weights for the training dataset.
+                Default: ``False``
 
         Returns:
             The mean, the minimum and maximum validation scores of the runs, for each metric, and the mean difference between validation and training MAE scores.
@@ -890,9 +870,6 @@ def get_crossvalidate_datasets(X, y, n_split, scaler, classes, plot=False, compu
     """
     skf = StratifiedKFold(n_splits=n_split, shuffle=True)
     target_tokenizer, drug_tokenizer = __get_tokenizers__()
-    #unique_classes = list(set(classes))
-    #class_to_idx = {cls: i for i, cls in enumerate(unique_classes)}
-    #classes = [class_to_idx[cls] for cls in classes]
 
     for i, (train_index, val_index) in enumerate(skf.split(X, classes)):
         train_X = X.iloc[train_index]
@@ -919,6 +896,8 @@ def evaluate(model, accelerator, dataset, metrics = [R2Score(), MeanAbsoluteErro
             dataset (torch Dataset): Dataset containing the data to evaluate the model on
             metrics: a list of metrics the model will be evaluated against
                 Default: ``[R2Score(), MeanAbsoluteError(), PearsonCorrCoef()]``
+            train (bool): if ``True``, the model will be set to training mode, otherwise it will be set to evaluation mode
+                Default: ``False``
 
             Returns:
                 A list of pairs with metrics and their corresponding scores
@@ -992,7 +971,7 @@ def evaluate(model, accelerator, dataset, metrics = [R2Score(), MeanAbsoluteErro
     plt.legend()
 
     fig = plt.gcf()  # Get the current figure
-    current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
+    current_time = datetime.now().strftime('%Y%m%d_%H%M%S_%f')[:-3]
     fig.savefig(f"{PLOT_DIR}/prediction_{current_time}.png")
     plt.close(fig)
 
@@ -1009,24 +988,30 @@ def __get_tokenizers__():
     """
     target_tokenizer = RobertaTokenizerFast.from_pretrained('./tokenizer')
     drug_tokenizer = ChembertaTokenizer("./chemberta/vocab.json")
-    #RobertaTokenizerFast.from_pretrained("DeepChem/ChemBERTa-77M-MTR")
 
     return target_tokenizer, drug_tokenizer
 
 def create_finetune_model(train_parameters, path, scaler=None, load_weights=None, pretrained=None):
     """
-            Load the pretrained models and prepare them for finetuning.
-            LoRA is prepared for finetuning and LoftQ is applied for the target encoder.
+    Loads pretrained encoders and prepares the full interaction model for finetuning.
 
-            Parameters:
-                train_parameters (dict str -> obj): training parameters
-                path (str): path to the pretrained model
-                load_weights (str): path of the presaved model weights to load, if available. If not, create a new model. 
-                    Default: None
-            Returns:
-                a transformers accelerator and the model to be trained.
+    The model combines a target encoder and a drug encoder into a joint architecture,
+    and optionally loads previously saved weights or pretrained model parameters.
 
+    Parameters:
+        train_parameters (dict str -> obj): Dictionary containing training configuration parameters such as dropout rates and gradient accumulation steps.
+        path (str): Path to the pretrained target encoder (e.g., a HuggingFace model directory).
+        scaler: Optional scaler used for label normalization during training.
+            Default: ``None``
+        load_weights (str): Path to saved model weights to load. If ``None``, a new model instance is initialized.
+            Default: ``None``
+        pretrained (str): Path to a previously saved full model (including drug and target encoders).
+            Default: ``None``
+
+    Returns:
+        Tuple[Accelerator, nn.Module]: A HuggingFace ``Accelerator`` for distributed training and the initialized model ready for finetuning.
     """
+
     torch.cuda.empty_cache()
 
     drug_encoder_config = AutoConfig.from_pretrained("DeepChem/ChemBERTa-77M-MTR")
@@ -1053,7 +1038,7 @@ def create_finetune_model(train_parameters, path, scaler=None, load_weights=None
 
     if load_weights:
         model.load_state_dict(torch.load(load_weights))
-
+        
     kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
     accelerator = Accelerator(gradient_accumulation_steps=train_parameters["gradient_accumulation_steps"], kwargs_handlers=[kwargs])
 
@@ -1185,20 +1170,28 @@ def finetune_objective(trial, X, y, n_split, scaler, classes, short_mode, path, 
 
 def finetune_optimize(X, y, n_split, scaler, classes, short_mode, path=None, compute_weights=False, optimize_path=None):
     """
-        Use Optuna TPESampler to optimize finetuning parameters.
-        
-        Parameters:
-            X (pandas.DataFrame): dataframe containing data used for prediction
-            y (List): list containing labels to predict for each interaction (dissociation constant)
-            n_split (int): number of cross validation folds to split the data into
-            scaler: scaler to apply on labels
-            classes (List): classes by which to stratify the folds.
-            short_mode (bool): if True, crossvalidation is not complete, meaning that only half of crossvalidation rounds are applied.
-                Default: False
-            path (str): path to the pretrained model
-                Default: None
-        Returns:
-            The best hyperparameters found by the optimization.
+    Uses Optuna's TPESampler to optimize finetuning hyperparameters through cross-validation.
+
+    Runs either a fresh or resumed Optuna study depending on the presence of ``optimize_path``.
+    In distributed settings, it synchronizes the study creation and optimization using ``torch.distributed``.
+
+    Parameters:
+        X (pandas.DataFrame): Dataframe containing input features for prediction.
+        y (List): List of labels (e.g., dissociation constants) for each interaction.
+        n_split (int): Number of cross-validation folds.
+        scaler: A scaler object used to normalize or transform the target labels.
+        classes (List): Class labels used to stratify the cross-validation splits.
+        short_mode (bool): If ``True``, only half of the cross-validation rounds are run (for speed).
+            Default: ``False``
+        path (str): Path to the pretrained model to be fine-tuned.
+            Default: ``None``
+        compute_weights (bool): Whether to compute sample weights during training.
+            Default: ``False``
+        optimize_path (str): Path to a previously saved Optuna study to resume optimization.
+            Default: ``None``
+
+    Returns:
+        dict: The best set of hyperparameters found during the optimization process.
     """
     n_trials = 25
     has_local = "LOCAL_RANK" in os.environ 
@@ -1235,15 +1228,10 @@ def finetune_optimize(X, y, n_split, scaler, classes, short_mode, path=None, com
     if has_local:
         torch.distributed.barrier()  # Ensure rank 0 finishes creating the study
 
-    #study = optuna.load_study(
-    #    study_name="finetuning_parameter_selection",
-    #    storage=storage
-    #)
 
     if has_local:
         torch.distributed.barrier()  # Optional: synchronize after loading the study
 
-    #os.environ["CUDA_VISIBLE_DEVICES"] = str(local_rank)
     print("Starting optimization...")
     if rank == 0:
         study.optimize(lambda trial: finetune_objective(trial, X, y, n_split, scaler, classes, short_mode, path, compute_weights=compute_weights), n_trials=n_trials, n_jobs=1)

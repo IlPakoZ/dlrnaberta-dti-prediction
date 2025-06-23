@@ -7,11 +7,9 @@ import os
 import pandas as pd 
 import model
 from transformers import TrainingArguments, HfArgumentParser
-from sklearn.model_selection import StratifiedShuffleSplit
 import evaluate
-import numpy as np
 from tqdm import tqdm
-import sys
+import analysis
 
 if __name__ == "__main__":
     # Check if CUDA is available
@@ -27,7 +25,7 @@ if __name__ == "__main__":
 
 
     parser = argparse.ArgumentParser(description="RNA-Based DTI", formatter_class=RawTextHelpFormatter)
-    parser.add_argument('--task', '-t', type=int, required=True, help="Task to perform:\n\t1 for pretraining RNABERTa;\n\t2 for finetuning with crossvalidation;\n\t3 for pretraining hyperparameter optimization\n\t4 for finetuning hyperparameter optimization;\n\t5 for training the tokenizer;\n\t6 for finetuning the model;\n\t7 for prediction.")
+    parser.add_argument('--task', '-t', type=int, required=True, help="Task to perform:\n\t1 for pretraining RNABERTa;\n\t2 for finetuning with crossvalidation;\n\t3 for pretraining hyperparameter optimization\n\t4 for finetuning hyperparameter optimization;\n\t5 for training the tokenizer;\n\t6 for finetuning the model;\n\t7 for prediction.\n\t8 for interpretability analysis;\n\t9 for interpretability analysis with attention modification.")
     parser.add_argument('--tok_file', '-k', type=str, required=False, nargs='+', help="List of files for training the tokenizer (tokenizer training only)")
     parser.add_argument('--path', '-p', type=str, required=False, help="Path to the folder containing the datasets")
     parser.add_argument('--lr', '-l', type=float, required=False, default=3e-4, help="Learning rate for the training")
@@ -41,9 +39,10 @@ if __name__ == "__main__":
     parser.add_argument("--load_weights", "-g", type=str, required=False, default=None, help="Path to the weights to load for the finetuning model")
     parser.add_argument("--compute_weights", "-c", action='store_true', help="Uses a MSE loss weighted by class during finetuning")
     parser.add_argument("--continue_optimize", "-s", type=str, default=None, help="Continue the finetuning optimization process by using the SQLite database file specified")
-    parser.add_argument("--input", "-i", type=str, default=None, help="Input a .csv file to use for prediction. The file should contain target-drug pairs, one per line, with elements separated by a comma")
+    parser.add_argument("--input", "-i", type=str, default=None, help="Input a .csv file to use for prediction (task 7). The file should contain target-drug pairs in .csv format with 'SMILES' and 'Target_RNA_sequence' columns, if the --cross argument is not specified. If the --cross argument is specified, the file should contain drugs in rows and targets in columns, with the first column being 'SMILES' and the rest being target sequences")
     parser.add_argument("--output", "-o", type=str, default=None, help="Outputs a .csv file containing predictions for each target-drug pair. If not specified, the predictions will be printed to the console")
     parser.add_argument("--device", "-d", type=str, default="cuda", help="Device to use for prediction (task 7). Default is 'cuda'.")
+    parser.add_argument("--cross", action='store_true', default=False, help="If specified, the model will take as input a file with drugs in rows and targets in columns and predict the interactions between each one of them. If false, the file should contain target-drug pairs in .csv format with 'SMILES' and 'Target_RNA_sequence' columns. Default is False.")
     args = parser.parse_args()
 
     if args.task == 1:
@@ -208,6 +207,7 @@ if __name__ == "__main__":
         accelerator, finetune_model = train.create_finetune_model(train_parameters, pretrained_model_path, scaler)
         scores, finetune_model, best_scores, best_finetune_model, difference_validation_train = train.finetune_and_evaluate(finetune_model, accelerator, train_parameters, train_dataset, val_dataset, True)
     elif args.task == 7:
+        # sanity checks
         if not args.path:
             print("Please, specify the folder containing the training and validation datasets using the -p flag")
             exit(1)
@@ -221,54 +221,130 @@ if __name__ == "__main__":
             if not os.path.exists(args.input):
                 print("Input file not found")
                 exit(1)
-        
-        has_local = "LOCAL_RANK" in os.environ 
+
+        has_local = "LOCAL_RANK" in os.environ
         local_rank = int(os.getenv("LOCAL_RANK", 0))
 
         if has_local:
             torch.distributed.init_process_group(backend="nccl", init_method="env://")
             torch.cuda.set_device(local_rank)
 
-        # Read the input CSV file where rows are drugs and columns are targets
-        inters = pd.read_csv(args.input, index_col=0)
-        drugs = inters.index
-        targets = inters.columns
-
+        # load model and tokenizers
         target_tokenizer, drug_tokenizer = train.__get_tokenizers__()
         pretrained_model_path = f"{args.path}/pretrained"
-        finetune_model, _, train_dataset, val_dataset, scaler = train.load_finetuned_model(pretrained_model_path, args.load_weights)
+        finetune_model, _, train_dataset, val_dataset, scaler = train.load_finetuned_model(
+            pretrained_model_path, args.load_weights
+        )
+        finetune_model = finetune_model.to(args.device)
+        finetune_model.eval()
 
-        # Prepare the predictions dataframe
-        predictions = pd.DataFrame(index=drugs, columns=targets)
+        if args.cross:
+            # -------------------------------------------------------
+            # CROSS MODE: input is a matrix of drugs×targets
+            # -------------------------------------------------------
+            inters = pd.read_csv(args.input, index_col=0)
+            drugs = inters.index
+            targets = inters.columns[1:]  # first col is SMILES
 
-        # Tokenize all drugs and targets once
-        tokenized_drugs = {drug: evaluate.tokenize_inputs(None, drug, target_tokenizer, drug_tokenizer, only_drug=True)[1] for drug in tqdm(drugs, desc="Tokenizing drugs")}
-        tokenized_targets = {target: evaluate.tokenize_inputs(target, None, target_tokenizer, drug_tokenizer, only_target=True)[0] for target in tqdm(targets, desc="Tokenizing targets")}
-        all_target_vs = [tokenized_targets[target] for target in targets]
-        print("Predicting drug-target interactions")    
-        i=1
+            # prep output DataFrame
+            predictions = pd.DataFrame(index=drugs, columns=targets)
 
-        if has_local:
-            torch.distributed.barrier()
+            # tokenize once
+            tokenized_drugs = {
+                drug: evaluate.tokenize_inputs(
+                    None, drug, target_tokenizer, drug_tokenizer, only_drug=True
+                )[1]
+                for drug in tqdm(drugs, desc="Tokenizing drugs")
+            }
+            tokenized_targets = {
+                tgt: evaluate.tokenize_inputs(
+                    tgt, None, target_tokenizer, drug_tokenizer, only_target=True
+                )[0]
+                for tgt in tqdm(targets, desc="Tokenizing targets")
+            }
+            all_tgt_vs = [tokenized_targets[t] for t in targets]
 
-        for drug in drugs:
-            start_time = datetime.now()
-            drug_v = tokenized_drugs[drug]            
-            res = list(evaluate.predict(finetune_model, all_target_vs, [drug_v]*len(all_target_vs), device=args.device)) 
-            predictions.loc[drug] = res
-            print(f"Drug {i}/{len(drugs)} completed in {(datetime.now() - start_time).total_seconds()} seconds")
-            i += 1
-            
+            if has_local:
+                torch.distributed.barrier()
 
+            # predict all pairs
+            print("Predicting drug–target interactions")
+            for i, drug in enumerate(drugs, start=1):
+                start_time = datetime.now()
+                drug_v = tokenized_drugs[drug]
+                scores = evaluate.predict(
+                    finetune_model,
+                    all_tgt_vs,
+                    [drug_v] * len(all_tgt_vs),
+                    device=args.device
+                )
+                row = pd.Series(list(scores), index=targets)
+                # only keep “active” predictions > 5
+                predictions.loc[drug, row > 5] = row[row > 5]
+                print(f"Drug {i}/{len(drugs)} done in {(datetime.now() - start_time).total_seconds():.1f}s")
+
+            predictions = predictions.fillna('')
+
+        else:
+            # —————————————————————————
+            # STANDARD MODE
+            # —————————————————————————
+            inters = pd.read_csv(f"{args.input}")
+            smiles_list = inters["SMILES"].tolist()
+            seq_list    = inters["Target_RNA_sequence"].tolist()
+            y_true = inters["pKd"].values if "pKd" in inters.columns else "NA"
+
+            # tokenize each pair
+            tokenized_targets = []
+            tokenized_drugs   = []
+            for seq, smi in tqdm(zip(seq_list, smiles_list), desc="Tokenizing input data..."):
+                t_t, d_t = evaluate.tokenize_inputs(
+                    seq, smi,
+                    target_tokenizer, drug_tokenizer,
+                    only_target=False, only_drug=False
+                )
+                tokenized_targets.append(t_t)
+                tokenized_drugs.append(d_t)
+                
+
+            # predict pKd for each pair
+            preds = evaluate.predict(
+                finetune_model,
+                tokenized_targets,
+                tokenized_drugs,
+                device=args.device
+            )
+            preds = list(preds)  # if it returns a generator
+
+            # assemble output DataFrame
+            predictions = pd.DataFrame({
+                "SMILES":              smiles_list,
+                "Target_RNA_sequence": seq_list,
+                "true_pKd":            y_true,
+                "predicted_pKd":       preds
+            })
+
+        # save or print
         if args.output:
-            # Save the predictions to a CSV file in the same format
-            predictions.to_csv(args.output)
+            # if cross: index is drugs, else default RangeIndex
+            predictions.to_csv(args.output, index=args.cross)
             print(f"Predictions saved to {args.output}")
         else:
-            # Print the predictions to the console
-            print(predictions)
+            for i, row in predictions.iterrows():
+                smi = row["SMILES"]
+                seq = row["Target_RNA_sequence"]
+                true_val = row["true_pKd"]
+                pred_val = row["predicted_pKd"]
 
-    elif args.task == 8:
+                # Truncate long SMILES and sequences
+                smi_display = smi if len(smi) <= 20 else smi[:17] + "..."
+                seq_display = seq if len(seq) <= 20 else seq[:17] + "..."
+
+                print(f"[{i+1:>3}] SMILES: {smi_display:<20}\t Target: {seq_display:<20}\t True pKd: {true_val:.3f}\t Predicted pKd: {pred_val:.3f}")
+
+
+
+    elif args.task == 8: 
         if not args.path:
             print("Please, specify the folder containing the training and validation datasets using the -p flag")
             exit(1)
@@ -277,7 +353,74 @@ if __name__ == "__main__":
             print("Please, specify the path to the weights to load using the -g flag")
             exit(1)
 
-        inters = pd.read_csv(f"{args.path}/processed/interactions/")
+        inters = pd.read_csv(f"{args.path}/processed/interactions/{args.finetune_data}")
+        X = inters[["SMILES", "Target_RNA_sequence"]]
+        y = inters['pKd']
+
+        pretrained_model_path = f"{args.path}/pretrained"
+
+        target_tokenizer, drug_tokenizer = train.__get_tokenizers__()
+        finetune_model, _, train_dataset, val_dataset, scaler = train.load_finetuned_model(pretrained_model_path, args.load_weights)
+
+        targets = []
+        drugs = []
+        for drug, target in zip(X["SMILES"], X["Target_RNA_sequence"]):
+            target_v, drug_v = evaluate.tokenize_inputs(target, drug, target_tokenizer, drug_tokenizer)
+            targets.append(target_v)
+            drugs.append(drug_v) 
+
+        MAE_mean = 0
+        i = 0
+        differences = []
+        
+        finetune_model = finetune_model.to(args.device)
+        finetune_model.eval()
+        finetune_model.INTERPR_ENABLE_MODE()
+
+        for (target, drug, res, presum), yval in zip(evaluate.interp_predict(finetune_model, targets, drugs), y):
+            train.print_if_0_rank("PREDICTED, REAL:", res[0][0], yval)
+            train.print_if_0_rank("Difference:", res[0][0] - yval)
+
+            if yval > 8 and res[0][0] > yval - 0.5 and res[0][0] < yval + 0.5:
+                analysis.plot_presum(target, presum, finetune_model.model.scaler, finetune_model.model.w, finetune_model.model.b, i, raw_affinities=True, path=args.load_weights)
+                analysis.plot_crossattention_weights(target["attention_mask"][0], drug["attention_mask"][0], target, drug, finetune_model.model.crossattention_weights[0][0], i, path=args.load_weights)
+
+            # Calculate the absolute difference
+            difference = abs(res[0][0] - yval)
+            differences.append(difference)
+            MAE_mean += difference
+            i += 1
+        MAE_mean /= i
+        train.print_if_0_rank("MAE:", MAE_mean)
+        import matplotlib.pyplot as plt
+
+        # Plot the histogram
+        plt.figure(figsize=(10, 6))
+        plt.hist(differences, bins=20, color='blue', alpha=0.7, edgecolor='black')
+        plt.title('MAE Distribution')
+        plt.xlabel('Absolute Error')
+        plt.ylabel('Frequency')
+        plt.grid(axis='y', alpha=0.75)
+
+
+        # Save the plot
+        plot_path = os.path.join(args.load_weights, "mae_distribution.png")
+        plt.savefig(plot_path)
+        print("Plot saved at:", plot_path)
+        print(f"MAE distribution plot saved at {plot_path}")
+        exit(0)
+
+
+    elif args.task == 9:
+        if not args.path:
+            print("Please, specify the folder containing the training and validation datasets using the -p flag")
+            exit(1)
+
+        if not args.load_weights:
+            print("Please, specify the path to the weights to load using the -g flag")
+            exit(1)
+
+        inters = pd.read_csv(f"{args.path}/processed/interactions/{args.finetune_data}")
         X = inters[["SMILES", "Target_RNA_sequence"]]
         y = inters['pKd'].values
 
@@ -296,32 +439,64 @@ if __name__ == "__main__":
         MAE_mean = 0
         i = 0
         differences = []
-        for (res, yval) in zip(evaluate.predict(finetune_model, targets, drugs), y):
-            train.print_if_0_rank("PREDICTED, REAL:", res, yval)
-            train.print_if_0_rank("Difference:", res[0][0] - yval)
+        
+        finetune_model = finetune_model.to(args.device)
+        finetune_model.eval()
+        finetune_model.INTERPR_ENABLE_MODE()
+
+        for (target, drug, res, presum), yval in zip(evaluate.interp_predict(finetune_model, targets, drugs), y):
+            orig_pred = res[0][0].item()
+            orig_diff = abs(orig_pred - yval.item())
+            train.print_if_0_rank("PREDICTED, REAL:", orig_pred, yval)
+            train.print_if_0_rank("Difference:", orig_diff)
+            
+            analysis.plot_presum(target, presum, finetune_model.model.scaler, finetune_model.model.w, finetune_model.model.b, f"{i}pre", raw_affinities=False, path=args.load_weights)
+            analysis.plot_presum(target, presum, finetune_model.model.scaler, finetune_model.model.w, finetune_model.model.b, f"{i}pre", raw_affinities=True, path=args.load_weights)
+            analysis.plot_crossattention_weights(target["attention_mask"][0], drug["attention_mask"][0], target, drug, finetune_model.model.crossattention_weights[0][0], f"{i}pre", path=args.load_weights)
+
+            new_attention_scores = finetune_model.model.scores[0][0]
+            max_index = torch.argmax(new_attention_scores)
+
+            new_attention_scores.view(-1)[max_index] = 0
+            #train.print_if_0_rank("NEW ATTENTION WEIGHTS:", new_attention_weights)
+            finetune_model.INTERPR_OVERRIDE_ATTN(new_attention_scores.reshape(1, 1, *new_attention_scores.shape))
+            # re-predict with modified attention
+            gen = evaluate.interp_predict(finetune_model, [target], [drug])
+            
+
+            _, _, after_res, presum = next(gen)
+            analysis.plot_presum(target, presum, finetune_model.model.scaler, finetune_model.model.w, finetune_model.model.b, f"{i}post", raw_affinities=False, path=args.load_weights)
+            analysis.plot_presum(target, presum, finetune_model.model.scaler, finetune_model.model.w, finetune_model.model.b, f"{i}post", raw_affinities=True, path=args.load_weights)
+            analysis.plot_crossattention_weights(target["attention_mask"][0], drug["attention_mask"][0], target, drug, finetune_model.model.crossattention_weights[0][0], f"{i}post", path=args.load_weights)
+            new_pred = after_res[0][0].item()
+            new_diff = abs(new_pred - yval.item())
+
+            # Print after-modification results
+            train.print_if_0_rank("MOD  PREDICTED, REAL:", new_pred, yval.item())
+            train.print_if_0_rank("MOD    Difference:", new_diff)
+
+            # Compute change
+            diff_change = new_diff - orig_diff
+            sign = "increased" if diff_change > 0 else "decreased" if diff_change < 0 else "unchanged"
+            magnitude = abs(diff_change)
+
+            train.print_if_0_rank(
+                f"ERROR {sign} by", magnitude
+            )
+            train.print_if_0_rank(
+                f"PRED change:", new_pred - orig_pred
+            )
+
+                    
+            finetune_model.INTERPR_RESET_OVERRIDE_ATTN()
+            # Calculate the absolute difference
             difference = abs(res[0][0] - yval)
             differences.append(difference)
             MAE_mean += difference
             i += 1
-
+        
         MAE_mean /= i
         train.print_if_0_rank("MAE:", MAE_mean)
-        import matplotlib.pyplot as plt
-
-        # Plot the histogram
-        plt.figure(figsize=(10, 6))
-        plt.hist(differences, bins=20, color='blue', alpha=0.7, edgecolor='black')
-        plt.title('MAE Distribution')
-        plt.xlabel('Absolute Error')
-        plt.ylabel('Frequency')
-        plt.grid(axis='y', alpha=0.75)
-
-        # Save the plot
-        plot_path = os.path.join(args.load_weights, "mae_distribution.png")
-        plt.savefig(plot_path)
-        print("Plot saved at:", plot_path)
-        print(f"MAE distribution plot saved at {plot_path}")
-        exit(0)
     else:
         print("Invalid task")
         exit(1)

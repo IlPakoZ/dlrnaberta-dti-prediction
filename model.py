@@ -1,7 +1,5 @@
 import torch
 import torch.nn as nn
-import pandas as pd
-import numpy as np
 import pickle
 from torch.utils.data import Dataset
 from transformers import PretrainedConfig, PreTrainedModel, Trainer, get_cosine_schedule_with_warmup
@@ -10,9 +8,8 @@ from dataclasses import dataclass, field
 from transformers.trainer import IS_SAGEMAKER_MP_POST_1_10
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
-from torch.nn.init import xavier_uniform_, xavier_normal_, constant_
-import train, math
-from math import sqrt
+from torch.nn.init import xavier_uniform_, constant_
+import math
 from tokenizers.models import WordLevel
 from tokenizers import Tokenizer
 from tokenizers.pre_tokenizers import Split
@@ -49,7 +46,8 @@ class ChembertaTokenizer:
                 ('[SEP]', self.tokenizer.token_to_id('[SEP]'))
             ]
         )
-    def __call__(self, inputs, padding=None, truncation=False,
+
+    def encode(self, inputs, padding=None, truncation=False,
                  max_length=None, return_tensors=None):
         # Configure padding/truncation
         if padding:
@@ -84,7 +82,34 @@ class ChembertaTokenizer:
             }
             return BatchEncoding(data=data, encoding=enc, tensor_type=tensor_type)
 
+    def __call__(self, inputs, padding=None, truncation=False,
+                 max_length=None, return_tensors=None):
+        return self.encode(inputs, padding=padding, truncation=truncation,
+                           max_length=max_length, return_tensors=return_tensors)
         
+    def convert_ids_to_tokens(self, ids, skip_special_tokens=False):
+        def _decode_sequence(seq):
+            if skip_special_tokens:
+                seq = [idx for idx in seq if idx not in self.special_token_ids]
+            return [self.tokenizer.id_to_token(idx) for idx in seq]
+
+        # 1) batch: list of lists or torch tensor
+        if isinstance(ids, torch.Tensor):
+            ids = ids.tolist()
+            if len(ids) == 1:
+                ids = ids[0]
+            
+        if isinstance(ids, (list)) and len(ids) > 0 and isinstance(ids[0], (list)):
+            return [_decode_sequence(seq) for seq in ids]
+
+        # 2) single sequence: list of ints or torch tensor
+        if isinstance(ids, (list)):
+            return _decode_sequence(ids)
+        
+        # 3) single int
+        if isinstance(ids, int):
+            return self.tokenizer.id_to_token(ids)
+
     def decode(self, ids, skip_special_tokens=False):
         def _decode_sequence(seq):
             if skip_special_tokens:
@@ -127,6 +152,19 @@ class InteractionModelATTNForRegression(PreTrainedModel):
                                           config.attention_dropout,
                                           config.hidden_dropout,
                                           config.num_heads)
+    
+    def INTERPR_ENABLE_MODE(self):
+        """
+        Enables the interpretability mode for the model.
+        """
+        self.model.INTERPR_ENABLE_MODE()
+
+
+    def INTERPR_OVERRIDE_ATTN(self, new_weights):
+        self.model.INTERPR_OVERRIDE_ATTN(new_weights)
+
+    def INTERPR_RESET_OVERRIDE_ATTN(self):
+        self.model.INTERPR_RESET_OVERRIDE_ATTN()
 
     def forward(self, x1, x2):
         return self.model(x1, x2)
@@ -175,7 +213,7 @@ class CrossAttention(nn.Module):
 
         self.drop_out = nn.Dropout(hidden_dropout)
      
-    def forward(self, query, key, value, key_padding_mask=None, attn_mask=None):
+    def forward(self, query, key, value, key_padding_mask=None, attn_mask=None, replace_weights=None):
         """
         Forward pass for cross attention.
 
@@ -201,7 +239,7 @@ class CrossAttention(nn.Module):
         K = K.view(batch_size, self.num_heads, key_len, self.head_dim)
         V = V.view(batch_size, self.num_heads, key_len, self.head_dim)
         
-            # Compute scaled dot-product attention scores
+        # Compute scaled dot-product attention scores
         scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.head_dim)  # (batch_size, num_heads, query_len, key_len)
 
         if key_padding_mask is not None:
@@ -209,11 +247,18 @@ class CrossAttention(nn.Module):
             key_padding_mask = key_padding_mask.unsqueeze(1).unsqueeze(1)  # (B, 1, 1, key_len) for broadcasting
             scores = scores.masked_fill(key_padding_mask, float('-inf'))  # Set masked positions to -inf
 
+
+        if replace_weights is not None:
+            scores = replace_weights
+        
         # Compute attention weights using softmax
         attn_weights = torch.nn.functional.softmax(scores, dim=-1)  # (batch_size, num_heads, query_len, key_len)
+        self.scores = scores
         if attn_mask is not None:
             attn_mask = attn_mask.unsqueeze(1)  # Shape: (batch_size, 1, query_len, key_len)
             attn_weights = attn_weights.masked_fill(attn_mask, 0)  # Set masked positions to 0
+
+
 
         # Optionally apply dropout to the attention weights if self.dropout is defined
         attn_weights = self.attn_dropout(attn_weights)
@@ -231,6 +276,11 @@ class CrossAttention(nn.Module):
 class InteractionModelATTN(nn.Module):
     def __init__(self, target_encoder, drug_encoder, scaler, attention_dropout, hidden_dropout, num_heads=1, kernel_size=1):
         super().__init__()
+        self.replace_weights = None
+        self.crossattention_weights = None
+        self.presum_layer = None
+        self.INTERPR_MODE = False
+
         self.scaler = scaler
         self.attention_dropout = attention_dropout
         self.hidden_dropout = hidden_dropout
@@ -245,7 +295,6 @@ class InteractionModelATTN(nn.Module):
         self.dropout_map_drug = nn.Dropout(hidden_dropout)
 
         self.crossattention = CrossAttention(384, num_heads, attention_dropout, hidden_dropout)
-        self.norm1 = nn.LayerNorm(384)                          # For attention output
         self.summary1 = nn.Linear(384, 384)
         self.summary2 = nn.Linear(384, 1)
         self.dropout_summary = nn.Dropout(hidden_dropout)
@@ -257,6 +306,22 @@ class InteractionModelATTN(nn.Module):
         self.b = Parameter(torch.zeros(1))
 
     def forward(self, x1, x2):     
+        """
+        Forward pass for attention interaction model.
+
+        Args:
+            x1 (dict): A dictionary containing input tensors for the target encoder.
+                Expected keys:
+                    - 'input_ids' (torch.Tensor): Token IDs for the target input.
+                    - 'attention_mask' (torch.Tensor): Attention mask for the target input.
+            x2 (dict): A dictionary containing input tensors for the drug encoder.
+                Expected keys:
+                    - 'input_ids' (torch.Tensor): Token IDs for the drug input.
+                    - 'attention_mask' (torch.Tensor): Attention mask for the drug input.
+
+        Returns:
+            torch.Tensor: A tensor representing the predicted binding affinity.
+        """
         x1["attention_mask"] = x1["attention_mask"].bool()   # Fix dropout model issue: https://github.com/pytorch/pytorch/issues/86120
         y1 = self.target_encoder(**x1).last_hidden_state     # The target
 
@@ -277,8 +342,19 @@ class InteractionModelATTN(nn.Module):
         y2 = self.dropout_map_drug(y2)
 
         key_padding_mask=(x2["attention_mask"] == 0) # S
-
-        out, _ = self.crossattention(y1, y2, y2, key_padding_mask=key_padding_mask, attn_mask=None)
+        
+        replace_weights = None
+        # If in interpretation mode, allow the replacement of cross-attention weights
+        if self.INTERPR_MODE:
+            if self.replace_weights is not None:
+                replace_weights = self.replace_weights
+        
+        out, _ = self.crossattention(y1, y2, y2, key_padding_mask=key_padding_mask, attn_mask=None, replace_weights=replace_weights)
+        
+        # If in interpretation mode, make cross-attention weights and scores accessible from the outside
+        if self.INTERPR_MODE:
+            self.crossattention_weights = _
+            self.scores = self.crossattention.scores
 
         out = self.summary1(out * query_mask)
         out = self.gelu(out)
@@ -286,6 +362,10 @@ class InteractionModelATTN(nn.Module):
         out = self.summary2(out).squeeze(-1)
 
         out = self.layer_norm(out)
+        
+        # If in interpretation mode, make final summation layer contributions accessible from the outside
+        if self.INTERPR_MODE:
+            self.presum_layer = out
 
         out = out.sum(dim=1, keepdim=True)*self.w + self.b
         return out
@@ -294,20 +374,38 @@ class InteractionModelATTN(nn.Module):
         super().train(mode)
         self.target_encoder.train(mode)
         self.drug_encoder.train(mode)
+        self.crossattention.train(mode)
         return self
     
     def eval(self): 
         super().eval()
         self.target_encoder.eval()
         self.drug_encoder.eval()
+        self.crossattention.eval()
         return self
-    """
+    
+    def INTERPR_ENABLE_MODE(self):
+        """
+        Enables the interpretability mode for the model.
+        """
+        if self.training:
+            raise RuntimeError("Cannot enable interpretability mode while the model is training.")
+        self.INTERPR_MODE = True
+
+
+    def INTERPR_OVERRIDE_ATTN(self, new_weights):
+        self.replace_weights = new_weights
+
+    def INTERPR_RESET_OVERRIDE_ATTN(self):
+        self.replace_weights = None
+        
+    def unscale(self, x):
+        """
         Unscales the labels using a scaler. If the scaler is not specified, don't do anything.
 
         Parameters:
             target_value: the target values to be unscaled
-    """
-    def unscale(self, x):
+        """
         with torch.no_grad():
             if self.scaler is None:
                 return x
