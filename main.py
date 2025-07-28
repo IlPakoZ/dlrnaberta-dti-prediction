@@ -43,6 +43,7 @@ if __name__ == "__main__":
     parser.add_argument("--output", "-o", type=str, default=None, help="Outputs a .csv file containing predictions for each target-drug pair. If not specified, the predictions will be printed to the console")
     parser.add_argument("--device", "-d", type=str, default="cuda", help="Device to use for prediction (task 7). Default is 'cuda'.")
     parser.add_argument("--cross", action='store_true', default=False, help="If specified, the model will take as input a file with drugs in rows and targets in columns and predict the interactions between each one of them. If false, the file should contain target-drug pairs in .csv format with 'SMILES' and 'Target_RNA_sequence' columns. Default is False.")
+    parser.add_argument("--split", type=str, default="random", help="Specify 'random' to use random split, or 'group' to use group splitting based on RNA sequence. Default is 'random'.")
     args = parser.parse_args()
 
     if args.task == 1:
@@ -108,7 +109,7 @@ if __name__ == "__main__":
             "gradient_accumulation_steps": 1,
             "learning_rate": args.lr,
             "adam_epsilon": 1e-6,
-            "num_epochs": 300,
+            "num_epochs": 100,
             "weight_decay": args.weight_decay,
             "hidden_dropout": args.hidden_do,
             "attention_dropout": args.attention_do,
@@ -117,7 +118,11 @@ if __name__ == "__main__":
         }
        
         inters = pd.read_csv(f"{args.path}/processed/interactions/{args.finetune_data}")
-        X = inters[["SMILES", "Target_RNA_sequence"]]
+        cols = ["SMILES", "Target_RNA_sequence"]
+        if "fold" in inters.columns:
+            cols.append("fold")
+
+        X = inters[cols]
         y = inters['pKd'].values
         classes = inters["Category"].values
 
@@ -130,7 +135,7 @@ if __name__ == "__main__":
             torch.distributed.init_process_group(backend="nccl", init_method="env://")
             torch.cuda.set_device(local_rank)
             
-        result = train.crossvalidate(X, y, 10, train_parameters, scaler, classes, path=pretrained_model_path, compute_weights=args.compute_weights)
+        result = train.crossvalidate(X, y, 10, train_parameters, scaler, classes, path=pretrained_model_path, compute_weights=args.compute_weights, split_type=args.split.lower())
         print(result)       
     
     elif args.task == 3:
@@ -147,12 +152,16 @@ if __name__ == "__main__":
         
         inters = pd.read_csv(f"{args.path}/processed/interactions/{args.finetune_data}")
         pretrained_model_path = f"{args.path}/pretrained"
-        X = inters[["SMILES", "Target_RNA_sequence"]]
+        cols = ["SMILES", "Target_RNA_sequence"]
+        if "fold" in inters.columns:
+            cols.append("fold")
+
+        X = inters[cols]
         y = inters['pKd'].values
         scaler = model.StdScaler()
         classes = inters["Category"].values
 
-        train.finetune_optimize(X, y, 10, scaler, classes, True, pretrained_model_path, compute_weights=args.compute_weights, optimize_path=args.continue_optimize)
+        train.finetune_optimize(X, y, 10, scaler, classes, True, pretrained_model_path, compute_weights=args.compute_weights, optimize_path=args.continue_optimize, split_type=args.split.lower())
 
     elif args.task == 5:
         if not args.tok_file:
@@ -178,7 +187,7 @@ if __name__ == "__main__":
             "gradient_accumulation_steps": 1,
             "learning_rate": args.lr,
             "adam_epsilon": 1e-6,
-            "num_epochs": 300,
+            "num_epochs": 100,
             "weight_decay": args.weight_decay,
             "hidden_dropout": args.hidden_do,
             "attention_dropout": args.attention_do,
@@ -186,7 +195,11 @@ if __name__ == "__main__":
             "target_epochs":100
         } 
         inters = pd.read_csv(f"{args.path}/processed/interactions/{args.finetune_data}")
-        X = inters[["SMILES", "Target_RNA_sequence"]]
+        cols = ["SMILES", "Target_RNA_sequence"]
+        if "fold" in inters.columns:
+            cols.append("fold")
+
+        X = inters[cols]
         y = inters['pKd'].values
 
         if args.compute_weights:
@@ -279,8 +292,8 @@ if __name__ == "__main__":
                     device=args.device
                 )
                 row = pd.Series(list(scores), index=targets)
-                # only keep “active” predictions > 5
-                predictions.loc[drug, row > 5] = row[row > 5]
+                # only keep “active” predictions >= 6
+                predictions.loc[drug, row >= 6] = row[row >= 6]
                 print(f"Drug {i}/{len(drugs)} done in {(datetime.now() - start_time).total_seconds():.1f}s")
 
             predictions = predictions.fillna('')
@@ -354,7 +367,11 @@ if __name__ == "__main__":
             exit(1)
 
         inters = pd.read_csv(f"{args.path}/processed/interactions/{args.finetune_data}")
-        X = inters[["SMILES", "Target_RNA_sequence"]]
+        cols = ["SMILES", "Target_RNA_sequence"]
+        if "fold" in inters.columns:
+            cols.append("fold")
+
+        X = inters[cols]
         y = inters['pKd']
 
         pretrained_model_path = f"{args.path}/pretrained"
@@ -373,6 +390,7 @@ if __name__ == "__main__":
         i = 0
         differences = []
         
+        
         finetune_model = finetune_model.to(args.device)
         finetune_model.eval()
         finetune_model.INTERPR_ENABLE_MODE()
@@ -382,7 +400,8 @@ if __name__ == "__main__":
             train.print_if_0_rank("Difference:", res[0][0] - yval)
 
             if yval > 8 and res[0][0] > yval - 0.5 and res[0][0] < yval + 0.5:
-                analysis.plot_presum(target, presum, finetune_model.model.scaler, finetune_model.model.w, finetune_model.model.b, i, raw_affinities=True, path=args.load_weights)
+                analysis.plot_presum(target, presum, finetune_model.model.scaler, finetune_model.model.w.squeeze(1), finetune_model.model.b, i, raw_affinities=True, path=args.load_weights)
+                analysis.plot_presum(target, presum, finetune_model.model.scaler, finetune_model.model.w.squeeze(1), finetune_model.model.b, i, raw_affinities=False, path=args.load_weights)
                 analysis.plot_crossattention_weights(target["attention_mask"][0], drug["attention_mask"][0], target, drug, finetune_model.model.crossattention_weights[0][0], i, path=args.load_weights)
 
             # Calculate the absolute difference
@@ -449,43 +468,46 @@ if __name__ == "__main__":
             orig_diff = abs(orig_pred - yval.item())
             train.print_if_0_rank("PREDICTED, REAL:", orig_pred, yval)
             train.print_if_0_rank("Difference:", orig_diff)
-            
-            analysis.plot_presum(target, presum, finetune_model.model.scaler, finetune_model.model.w, finetune_model.model.b, f"{i}pre", raw_affinities=False, path=args.load_weights)
-            analysis.plot_presum(target, presum, finetune_model.model.scaler, finetune_model.model.w, finetune_model.model.b, f"{i}pre", raw_affinities=True, path=args.load_weights)
-            analysis.plot_crossattention_weights(target["attention_mask"][0], drug["attention_mask"][0], target, drug, finetune_model.model.crossattention_weights[0][0], f"{i}pre", path=args.load_weights)
+            if yval.item() > 8 and orig_pred > yval.item() - 0.5 and orig_pred < yval.item() + 0.5:
 
-            new_attention_scores = finetune_model.model.scores[0][0]
-            max_index = torch.argmax(new_attention_scores)
+                analysis.plot_presum(target, presum, finetune_model.model.scaler, finetune_model.model.w.squeeze(1), finetune_model.model.b, f"{i}pre", raw_affinities=False, path=args.load_weights)
+                analysis.plot_presum(target, presum, finetune_model.model.scaler, finetune_model.model.w.squeeze(1), finetune_model.model.b, f"{i}pre", raw_affinities=True, path=args.load_weights)
+                analysis.plot_crossattention_weights(target["attention_mask"][0], drug["attention_mask"][0], target, drug, finetune_model.model.crossattention_weights[0][0], f"{i}pre", path=args.load_weights)
 
-            new_attention_scores.view(-1)[max_index] = 0
-            #train.print_if_0_rank("NEW ATTENTION WEIGHTS:", new_attention_weights)
-            finetune_model.INTERPR_OVERRIDE_ATTN(new_attention_scores.reshape(1, 1, *new_attention_scores.shape))
-            # re-predict with modified attention
-            gen = evaluate.interp_predict(finetune_model, [target], [drug])
-            
+                scores = finetune_model.model.scores
+                new_attention_scores = finetune_model.model.scores[0][0]
+                weights = torch.nn.functional.softmax(scores, dim=-1)[0][0]
 
-            _, _, after_res, presum = next(gen)
-            analysis.plot_presum(target, presum, finetune_model.model.scaler, finetune_model.model.w, finetune_model.model.b, f"{i}post", raw_affinities=False, path=args.load_weights)
-            analysis.plot_presum(target, presum, finetune_model.model.scaler, finetune_model.model.w, finetune_model.model.b, f"{i}post", raw_affinities=True, path=args.load_weights)
-            analysis.plot_crossattention_weights(target["attention_mask"][0], drug["attention_mask"][0], target, drug, finetune_model.model.crossattention_weights[0][0], f"{i}post", path=args.load_weights)
-            new_pred = after_res[0][0].item()
-            new_diff = abs(new_pred - yval.item())
+                max_index = torch.argmax(weights)
 
-            # Print after-modification results
-            train.print_if_0_rank("MOD  PREDICTED, REAL:", new_pred, yval.item())
-            train.print_if_0_rank("MOD    Difference:", new_diff)
+                new_attention_scores.view(-1)[max_index] = -10000
+                finetune_model.INTERPR_OVERRIDE_ATTN(new_attention_scores.reshape(1, 1, *new_attention_scores.shape))
+                # re-predict with modified attention
+                gen = evaluate.interp_predict(finetune_model, [target], [drug])
+                
 
-            # Compute change
-            diff_change = new_diff - orig_diff
-            sign = "increased" if diff_change > 0 else "decreased" if diff_change < 0 else "unchanged"
-            magnitude = abs(diff_change)
+                _, _, after_res, presum = next(gen)
+                analysis.plot_presum(target, presum, finetune_model.model.scaler, finetune_model.model.w.squeeze(1), finetune_model.model.b, f"{i}post", raw_affinities=False, path=args.load_weights)
+                analysis.plot_presum(target, presum, finetune_model.model.scaler, finetune_model.model.w.squeeze(1), finetune_model.model.b, f"{i}post", raw_affinities=True, path=args.load_weights)
+                analysis.plot_crossattention_weights(target["attention_mask"][0], drug["attention_mask"][0], target, drug, finetune_model.model.crossattention_weights[0][0], f"{i}post", path=args.load_weights)
+                new_pred = after_res[0][0].item()
+                new_diff = abs(new_pred - yval.item())
 
-            train.print_if_0_rank(
-                f"ERROR {sign} by", magnitude
-            )
-            train.print_if_0_rank(
-                f"PRED change:", new_pred - orig_pred
-            )
+                # Print after-modification results
+                train.print_if_0_rank("MOD  PREDICTED, REAL:", new_pred, yval.item())
+                train.print_if_0_rank("MOD    Difference:", new_diff)
+
+                # Compute change
+                diff_change = new_diff - orig_diff
+                sign = "increased" if diff_change > 0 else "decreased" if diff_change < 0 else "unchanged"
+                magnitude = abs(diff_change)
+
+                train.print_if_0_rank(
+                    f"ERROR {sign} by", magnitude
+                )
+                train.print_if_0_rank(
+                    f"PRED change:", new_pred - orig_pred
+                )
 
                     
             finetune_model.INTERPR_RESET_OVERRIDE_ATTN()

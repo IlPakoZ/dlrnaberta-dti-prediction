@@ -246,11 +246,10 @@ class CrossAttention(nn.Module):
             # Convert boolean mask (False -> -inf, True -> 0)
             key_padding_mask = key_padding_mask.unsqueeze(1).unsqueeze(1)  # (B, 1, 1, key_len) for broadcasting
             scores = scores.masked_fill(key_padding_mask, float('-inf'))  # Set masked positions to -inf
-
-
+    
         if replace_weights is not None:
             scores = replace_weights
-        
+
         # Compute attention weights using softmax
         attn_weights = torch.nn.functional.softmax(scores, dim=-1)  # (batch_size, num_heads, query_len, key_len)
         self.scores = scores
@@ -272,6 +271,7 @@ class CrossAttention(nn.Module):
         output = self.drop_out(output)
 
         return output, attn_weights
+
 
 class InteractionModelATTN(nn.Module):
     def __init__(self, target_encoder, drug_encoder, scaler, attention_dropout, hidden_dropout, num_heads=1, kernel_size=1):
@@ -295,15 +295,18 @@ class InteractionModelATTN(nn.Module):
         self.dropout_map_drug = nn.Dropout(hidden_dropout)
 
         self.crossattention = CrossAttention(384, num_heads, attention_dropout, hidden_dropout)
+        self.norm = nn.LayerNorm(384)
         self.summary1 = nn.Linear(384, 384)
         self.summary2 = nn.Linear(384, 1)
         self.dropout_summary = nn.Dropout(hidden_dropout)
-
+        self.layer_norm = nn.LayerNorm(384)
         self.gelu = nn.GELU()
-        self.layer_norm = nn.LayerNorm(512) 
 
-        self.w = Parameter(torch.ones(1))
+        self.w = Parameter(torch.empty(512, 1))
         self.b = Parameter(torch.zeros(1))
+        self.pdng = Parameter(torch.tensor(0.0))  # learnable padding value (0-dimensional)
+
+        xavier_uniform_(self.w)
 
     def forward(self, x1, x2):     
         """
@@ -360,15 +363,20 @@ class InteractionModelATTN(nn.Module):
         out = self.gelu(out)
         out = self.dropout_summary(out)
         out = self.summary2(out).squeeze(-1)
-
-        out = self.layer_norm(out)
         
         # If in interpretation mode, make final summation layer contributions accessible from the outside
         if self.INTERPR_MODE:
             self.presum_layer = out
 
-        out = out.sum(dim=1, keepdim=True)*self.w + self.b
-        return out
+        
+        weighted = out * self.w.squeeze(1)  # [batch, seq_len]
+        padding_positions = ~x1["attention_mask"]           # True at padding
+        # assign learnable pdng to all padding positions
+        weighted = weighted.masked_fill(padding_positions, self.pdng.item())
+
+        # sum across sequence and add bias
+        result = weighted.sum(dim=1, keepdim=True) + self.b
+        return result
 
     def train(self, mode = True): 
         super().train(mode)

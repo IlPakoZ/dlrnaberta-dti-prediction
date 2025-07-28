@@ -775,7 +775,7 @@ def __prepare_train_val_datasets__(drug_tokenizer, target_tokenizer, train_X, va
     return train_dataset, val_dataset
 
 
-def crossvalidate(X, y, n_split, train_parameters, scaler, classes, short_mode=False, path=None, use_best_scores=False, compute_weights=False):
+def crossvalidate(X, y, n_split, train_parameters, scaler, classes, short_mode=False, path=None, use_best_scores=False, compute_weights=False, split_type="random"):
     """
         Executes finetuning with crossvalidation.
 
@@ -802,7 +802,7 @@ def crossvalidate(X, y, n_split, train_parameters, scaler, classes, short_mode=F
     i = 0
 
     differences = []
-    for train_dataset, val_dataset in get_crossvalidate_datasets(X, y, n_split, scaler, classes, compute_weights=compute_weights):
+    for train_dataset, val_dataset in get_crossvalidate_datasets(X, y, n_split, scaler, classes, compute_weights=compute_weights, split_type=split_type):
         if (not short_mode) or (short_mode and i < n_split//2):    
             process = psutil.Process(os.getpid())  # Get current process
             mem_info = process.memory_info()  # Get memory usage details
@@ -812,6 +812,7 @@ def crossvalidate(X, y, n_split, train_parameters, scaler, classes, short_mode=F
                 
             print_if_0_rank(f"Fold {i+1}: Creating finetuning_model...")
             accelerator, finetune_model = create_finetune_model(train_parameters, path, scaler)
+            print("FINETUNE:", finetune_model)
             scores, finetune_model, best_scores, best_finetune_model, difference_validation_train = finetune_and_evaluate(finetune_model, accelerator, train_parameters, train_dataset, val_dataset, False)
             differences.append(difference_validation_train)
             print_if_0_rank(f"Fold {i+1}: Finished finetuning and evaluation.")
@@ -851,7 +852,7 @@ def crossvalidate(X, y, n_split, train_parameters, scaler, classes, short_mode=F
     
     
 
-def get_crossvalidate_datasets(X, y, n_split, scaler, classes, plot=False, compute_weights=False):
+def get_crossvalidate_datasets(X, y, n_split, scaler, classes, plot=False, compute_weights=False, split_type="random"):
     """
         Generate ``n_split`` crossvalidation datasets. If ``classes`` is not None, generated ``n_split`` folds stratified by classes.
 
@@ -863,27 +864,49 @@ def get_crossvalidate_datasets(X, y, n_split, scaler, classes, plot=False, compu
             classes (List): classes by which to stratify the folds.
             plot (bool): if ``True``, plots an histogram of the training and validation data distribution, binned by label value
                 Default: ``False``
+            compute_weights (bool): if ``True``, computes class weights for the training dataset.
 
         Yields:
             A pair of datasets obtained from the next crossvalidation split
 
-    """
-    skf = StratifiedKFold(n_splits=n_split, shuffle=True)
+    """ 
     target_tokenizer, drug_tokenizer = __get_tokenizers__()
 
-    for i, (train_index, val_index) in enumerate(skf.split(X, classes)):
-        train_X = X.iloc[train_index]
-        val_X = X.iloc[val_index]
-        train_y = y[train_index]
-        val_y = y[val_index]
-        if compute_weights == False:
-            w_classes = None
-        else:   
-            w_classes = classes[train_index]
+    if split_type == "random":
+        skf = StratifiedKFold(n_splits=n_split, shuffle=True)
 
-        train_dataset, val_dataset = __prepare_train_val_datasets__(drug_tokenizer, target_tokenizer, train_X, val_X, train_y, val_y, scaler, plot, w_classes)
+        for i, (train_index, val_index) in enumerate(skf.split(X, classes)):
+            train_X = X.iloc[train_index]
+            val_X = X.iloc[val_index]
+            train_y = y[train_index]
+            val_y = y[val_index]
+            if compute_weights == False:
+                w_classes = None
+            else:   
+                w_classes = classes[train_index]
 
-        yield train_dataset, val_dataset
+            train_dataset, val_dataset = __prepare_train_val_datasets__(drug_tokenizer, target_tokenizer, train_X, val_X, train_y, val_y, scaler, plot, w_classes)
+    
+            yield train_dataset, val_dataset
+
+    elif split_type == "group":
+        
+        for i in range(10):
+            val_index = X[X['fold'] == (i+1)].index
+            train_index = X[X['fold'] != (i+1)].index
+            train_X = X.iloc[train_index]
+            val_X = X.iloc[val_index]
+            train_y = y[train_index]
+            val_y = y[val_index]
+            if compute_weights == False:
+                w_classes = None
+            else:   
+                w_classes = classes[train_index]
+
+            train_dataset, val_dataset = __prepare_train_val_datasets__(drug_tokenizer, target_tokenizer, train_X, val_X, train_y, val_y, scaler, plot, w_classes)
+    
+
+            yield train_dataset, val_dataset
 
     
 def evaluate(model, accelerator, dataset, metrics = [R2Score(), MeanAbsoluteError(), PearsonCorrCoef()], train=False):
@@ -1018,7 +1041,6 @@ def create_finetune_model(train_parameters, path, scaler=None, load_weights=None
     drug_encoder_config.attention_probs_dropout_prob = train_parameters["attention_dropout"]
     drug_encoder_config.hidden_dropout_prob = train_parameters["hidden_dropout"]
     drug_encoder_config.pooler = None
-    drug_encoder = RobertaModel.from_pretrained("DeepChem/ChemBERTa-77M-MTR", config=drug_encoder_config, add_pooling_layer=False)
     drug_encoder = RobertaModel(config=drug_encoder_config, add_pooling_layer=False)
 
     target_encoder_config = AutoConfig.from_pretrained(path)
@@ -1095,7 +1117,7 @@ def make_bsh(filename=None):
     base_shapes = make_base_shapes(base_model, delta_model, savefile=filename)
     return base_shapes
 
-def finetune_objective(trial, X, y, n_split, scaler, classes, short_mode, path, compute_weights=False):
+def finetune_objective(trial, X, y, n_split, scaler, classes, short_mode, path, compute_weights=False, split_type="random"):
     
     has_local = "LOCAL_RANK" in os.environ
     
@@ -1160,7 +1182,7 @@ def finetune_objective(trial, X, y, n_split, scaler, classes, short_mode, path, 
         "target_epochs":100,
     })
 
-    results, difference = crossvalidate(X, y, n_split, train_parameters, scaler, classes, short_mode, path=path, compute_weights=compute_weights)
+    results, difference = crossvalidate(X, y, n_split, train_parameters, scaler, classes, short_mode, path=path, compute_weights=compute_weights, split_type=split_type)
     multipl = (2 ** (results["MeanAbsoluteError"][0] - 0.5)) / 2 + 0.2 * (results["MeanAbsoluteError"][0] - 0.5) ** 2 + 0.5
     difference = multipl * difference
     plt.close('all')  # Close all open figures
@@ -1168,7 +1190,7 @@ def finetune_objective(trial, X, y, n_split, scaler, classes, short_mode, path, 
     return np.mean(results["R2Score"][:2]), np.mean([results["MeanAbsoluteError"][0], results["MeanAbsoluteError"][2]]), difference
 
 
-def finetune_optimize(X, y, n_split, scaler, classes, short_mode, path=None, compute_weights=False, optimize_path=None):
+def finetune_optimize(X, y, n_split, scaler, classes, short_mode, path=None, compute_weights=False, optimize_path=None, split_type="random"):
     """
     Uses Optuna's TPESampler to optimize finetuning hyperparameters through cross-validation.
 
@@ -1234,10 +1256,10 @@ def finetune_optimize(X, y, n_split, scaler, classes, short_mode, path=None, com
 
     print("Starting optimization...")
     if rank == 0:
-        study.optimize(lambda trial: finetune_objective(trial, X, y, n_split, scaler, classes, short_mode, path, compute_weights=compute_weights), n_trials=n_trials, n_jobs=1)
+        study.optimize(lambda trial: finetune_objective(trial, X, y, n_split, scaler, classes, short_mode, path, compute_weights=compute_weights, split_type=split_type), n_trials=n_trials, n_jobs=1)
     else:
         for i in range(n_trials):
-            finetune_objective(0, X, y, n_split, scaler, classes, short_mode, path)
+            finetune_objective(i, X, y, n_split, scaler, classes, short_mode, path, compute_weights, split_type=split_type)
     if has_local:
         torch.distributed.barrier()
 

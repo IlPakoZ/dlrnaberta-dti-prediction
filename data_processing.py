@@ -4,6 +4,7 @@ import pandas as pd
 import numpy as np
 import subprocess
 from pathlib import Path
+from sklearn.model_selection import GroupKFold
 
 def __preprocess_fasta__(read):
     """
@@ -302,4 +303,101 @@ def create_finetuning_files(interactions_path):
         interactions.to_csv(f"./processed/interactions/{cat[0]}", index = False)
 
     excel[col_names+["Category"]].to_csv("./processed/interactions/all.csv", index = False)
+
+
+
+def create_finetuning_fold_split(proc_interactions_path, k=10, seed=42):
+    intrs = pd.read_csv(proc_interactions_path)
+    np.random.seed(seed)
+
+    intrs['fold'] = 0
+
+    for cat_name, cat_data in intrs.groupby("Category"):
+        subidx = cat_data.index
+        cat_df = cat_data.reset_index(drop=True)
+
+        # initial GroupKFold
+        groups = cat_df["Target_RNA_sequence"]
+        n_unique = groups.nunique()
+        n_splits = min(k, n_unique)
+        if n_splits < 2:
+            fold_ids = np.ones(len(cat_df), dtype=int)
+        else:
+            fold_ids = np.zeros(len(cat_df), dtype=int)
+            gkf = GroupKFold(n_splits=n_splits)
+            for fold, (_, test_idx) in enumerate(
+                gkf.split(X=cat_df, y=None, groups=groups)
+            ):
+                fold_ids[test_idx] = fold + 1
+
+        # pad to k
+        counts = pd.Series(fold_ids).value_counts() \
+                       .reindex(range(1, k+1), fill_value=0) \
+                       .sort_index()
+
+        # compute ideal per-fold counts
+        total = len(cat_df)
+        base, rem = divmod(total, k)
+        target = {i+1: base + (1 if i < rem else 0) for i in range(k)}
+
+        # if current != target, do an even redistribution
+        if not all(counts[i] == target[i] for i in range(1, k+1)):
+            # compute how many to move out/in
+            src_excess = {i: counts[i] - target[i] for i in range(1, k+1) if counts[i] > target[i]}
+            dst_need   = {i: target[i] - counts[i] for i in range(1, k+1) if counts[i] < target[i]}
+
+            # for each source fold (largest first) move into each dst fold (smallest first)
+            for src in sorted(src_excess, reverse=True):
+                excess = src_excess[src]
+                if excess <= 0:
+                    continue
+
+                # indices in this fold
+                src_idxs = np.where(fold_ids == src)[0]
+                ptr = 0
+                for dst in sorted(dst_need):
+                    need = dst_need[dst]
+                    if need <= 0:
+                        continue
+
+                    move = min(excess, need)
+                    to_move = src_idxs[ptr:ptr+move]
+                    fold_ids[to_move] = dst
+
+                    # update counters
+                    src_excess[src] -= move
+                    dst_need[dst]   -= move
+                    excess           -= move
+                    ptr             += move
+
+                    if excess == 0:
+                        break
+
+        # write back and report
+        intrs.loc[subidx, 'fold'] = fold_ids
+        final_counts = pd.Series(fold_ids).value_counts() \
+                             .reindex(range(1, k+1), fill_value=0) \
+                             .sort_index()
+
+        print(f"Category: {cat_name}")
+        print(f"Ideal per-fold: {base} (×{k-rem}), {base+1} (×{rem})")
+        print("Rows per fold (1–{}):".format(k))
+        print(final_counts.to_string())
+        print(f"Variance: {final_counts.var():.2f}")
+        print("-" * 40)
+
+    intrs.to_csv("./processed/interactions/all_folds.csv", index=False)
+
+
+
+def __count_num_in_groups__(cat_data, sequences, assigned_numbers):
+    sequence_to_group = dict(zip(sequences, assigned_numbers))
+
+    # Add group number to each row in the original data
+    cat_data = cat_data.copy()
+    cat_data["group_number"] = cat_data["Target_RNA_sequence"].map(sequence_to_group)
+
+    # Count how many rows belong to each group
+    group_counts = cat_data["group_number"].value_counts().reindex(range(1, 11), fill_value=0).sort_index()
+    return group_counts
 

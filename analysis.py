@@ -51,6 +51,124 @@ def count_training_lines(input_file):
     print("Total lines:", len(lines))
     return len(lines)
 
+
+
+def count_targets_tokens(input_file):
+    """
+    Counts the number of target tokens in the finetuning dataset and prints
+    statistics including total, mean, longest, and shortest sequence lengths,
+    the number of sequences exceeding 510 tokens, and the number of unique sequences.
+
+    Parameters:
+        input_file (str): Path to the finetuning dataset text file.
+    
+    Returns:
+        The total number of tokens in the finetuning dataset.
+    """
+    target_tokenizer, drug_tokenizer = train.__get_tokenizers__()
+    total_tokens = 0
+    max_tokens = 0
+    min_tokens = float('inf')
+    token_lengths = []
+    over_length_count = 0
+    seen_sequences = set()
+
+    df = pd.read_csv(input_file)
+    
+    for _, row in df.iterrows():
+        sequence = row["Target_RNA_sequence"]
+        seen_sequences.add(sequence)
+
+        tokenized = target_tokenizer(sequence)["input_ids"]
+        tokens = len(tokenized)
+
+        print("Sequence length:", tokens)
+
+        if tokens > 510:
+            print("Warning: Sequence length exceeds 510 tokens:", sequence)
+            over_length_count += 1
+
+        token_lengths.append(tokens)
+        total_tokens += tokens
+        max_tokens = max(max_tokens, tokens)
+        min_tokens = min(min_tokens, tokens)
+
+    mean_tokens = total_tokens / len(token_lengths) if token_lengths else 0
+    unique_sequences_count = len(seen_sequences)
+
+    print("\nSummary:")
+    print("Total tokens:", total_tokens)
+    print("Mean sequence length:", round(mean_tokens, 2))
+    print("Longest sequence length:", max_tokens)
+    print("Shortest sequence length:", min_tokens)
+    print("Sequences over 510 tokens:", over_length_count)
+    print("Unique sequences:", unique_sequences_count)
+
+    return total_tokens
+
+def count_drug_tokens(input_file):
+    """
+    Counts the number of tokens in the drug dataset and prints
+    statistics including total, mean, longest, and shortest sequence lengths,
+    the number of sequences exceeding 510 tokens, and the number of unique sequences.
+
+    Parameters:
+        input_file (str): Path to the finetuning dataset text file.
+
+    Returns:
+        The total number of tokens in the drug dataset.
+    """
+    target_tokenizer, drug_tokenizer = train.__get_tokenizers__()
+    total_tokens = 0
+    max_tokens = 0
+    min_tokens = float('inf')
+    token_lengths = []
+    over_length_count = 0
+    seen_sequences = set()
+
+    df = pd.read_csv(input_file)
+    
+    for _, row in df.iterrows():
+        sequence = row["SMILES"]
+        seen_sequences.add(sequence)
+
+        tokenized = drug_tokenizer(sequence)["input_ids"][0]
+        tokens = len(tokenized)
+
+        print("Drug length:", tokens)
+
+        if tokens > 510:
+            print("Warning: Drug length exceeds 510 tokens:", sequence)
+            over_length_count += 1
+
+        token_lengths.append(tokens)
+        total_tokens += tokens
+        max_tokens = max(max_tokens, tokens)
+        min_tokens = min(min_tokens, tokens)
+
+    mean_tokens = total_tokens / len(token_lengths) if token_lengths else 0
+    unique_sequences_count = len(seen_sequences)
+
+    print("\nDrug Summary:")
+    print("Total tokens:", total_tokens)
+    print("Mean drug length:", round(mean_tokens, 2))
+    print("Longest drug length:", max_tokens)
+    print("Shortest drug length:", min_tokens)
+    print("Drug over 510 tokens:", over_length_count)
+    print("Unique drug:", unique_sequences_count)
+
+    return total_tokens
+
+def total_length_training_lines(input_file):
+    
+    with open(input_file, "r") as f:
+        lines = f.readlines()
+        total_length = sum(len(line.strip()) for line in tqdm(lines))
+
+
+    print("Total length:", total_length)
+    return len(lines)
+
 def plot_overlapping_distributions(folder_path, column="pKd", num_bins=30, alpha=0.5):
     """
     Reads all CSV files in the specified folder, extracts the data from the given column,
@@ -124,6 +242,7 @@ def count_finetuning_tokens(input_file):
     for _, row in df.iterrows():
         sequence = row["Target_RNA_sequence"]
         tokens = len(target_tokenizer(sequence)["input_ids"])
+        
         if tokens > 510:
             print("Warning: Sequence length exceeds 510 tokens:", sequence)
         print("Sequence length:", tokens)
@@ -217,7 +336,7 @@ def plot_presum(tokenized_input, affinities, scaler, w, b, suffix, raw_affinitie
     
     affinities = w*(affinities[0]) + b / len(affinities[0])
     affinities = (affinities*scaler.std_) + scaler.mean_/len(affinities)
-
+    
     if sum(affinities) < 0 and not raw_affinities:
         raise ValueError("Cannot use non-raw affinities with negative binding affinity prediction")
 
