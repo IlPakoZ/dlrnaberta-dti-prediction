@@ -23,6 +23,51 @@ The model is composed of three parts:
 - **Dropout**: Configurable attention dropout and hidden dropout for regularization
 - **Layer normalization**: Applied for training stability
 
+## How to use
+
+```python
+from modeling_dlmberta import InteractionModelATTNForRegression, StdScaler
+from configuration_dlmberta import InteractionModelATTNConfig
+from transformers import AutoModel, RobertaModel, AutoConfig
+from chemberta import ChembertaTokenizer
+
+# Load model components
+config = InteractionModelATTNConfig.from_pretrained("path/to/model")
+# Load encoders
+target_encoder = AutoModel.from_pretrained("IlPakoZ/RNA-BERTa9700")
+
+drug_encoder_config = AutoConfig.from_pretrained("DeepChem/ChemBERTa-77M-MTR")
+drug_encoder_config.pooler = None
+drug_encoder = RobertaModel(config=drug_encoder_config, add_pooling_layer=False)
+
+# Load scaler (if available)
+scaler = StdScaler()
+scaler.load("path/to/model")
+
+# Initialize model
+model = InteractionModelATTNForRegression.from_pretrained(
+    "path/to/model",
+    config=config,
+    target_encoder=target_encoder,
+    drug_encoder=drug_encoder,
+    scaler=scaler
+)
+
+# Make predictions
+target_sequence = "AUGCGAUCGACGUACGUUAGCCGUAGCGUAGCUAGUGUAGCUAGUAGCU"
+drug_smiles = "C1=CC=C(C=C1)NC(=O)C2=CC=CC=N2"
+
+# Tokenize inputs
+target_inputs = target_tokenizer(target_sequence, padding="max_length", truncation=True, max_length=512, return_tensors="pt")
+drug_inputs = drug_tokenizer(drug_smiles, padding="max_length", truncation=True, max_length=512, return_tensors="pt")
+
+# Predict
+with torch.no_grad():
+    prediction = model(target_inputs, drug_inputs)
+    if model.scaler:
+        prediction = model.unscale(prediction)
+```
+        
 ## Datasets
 
 ### Fine-tuning Dataset (Training)
@@ -90,19 +135,22 @@ model.INTERPR_ENABLE_MODE()
 # Make prediction with interpretation data
 with torch.no_grad():
 # Unscale if scaler exists
-  if self.model.scaler is not None:
-    prediction = self.model.unscale(prediction)
+    prediction = model(target_inputs, drug_inputs)
+
+    if self.model.scaler is not None:
+        prediction = self.model.unscale(prediction)
                 
-  prediction_value = prediction.cpu().numpy()[0][0]
+    prediction_value = prediction.cpu().numpy()[0][0]
                 
-  # Access interpretation data
-  cross_attention_weights = model.model.crossattention_weights
-  presum_contributions = model.model.presum_layer
-  attention_scores = model.model.scores
+    # Access interpretation data
+    cross_attention_weights = model.model.crossattention_weights
+    presum_contributions = model.model.presum_layer
+    attention_scores = model.model.scores
 
 # Disable interpretation mode
 model.INTERPR_DISABLE_MODE()
 ```
+
 ## Other links
 
 [Try the model without set-up here.](https://huggingface.co/spaces/IlPakoZ/DLRNA-BERTa)<br>
