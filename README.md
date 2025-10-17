@@ -23,6 +23,13 @@ The model is composed of three parts:
 - **Dropout**: Configurable attention dropout and hidden dropout for regularization
 - **Layer normalization**: Applied for training stability
 
+## Requirements
+
+Use a Python version <b>3.11<b> and install the requirements.txt file in this folder.
+Separate CUDA installation is required to run the model on a GPU.
+
+Pretrained models and datasets are not uploaded in the repository directly. Instead, they are released as .zip package in the "Releases" section of this repository. Move the extracted folders in the cloned repository folder for immediate use.
+
 ## How to use
 
 ```python
@@ -68,6 +75,9 @@ with torch.no_grad():
         prediction = model.unscale(prediction)
 ```
         
+You can run the script `test-author-model.py` to evaluate Krishnan et. al.[^4] model performance.
+You can run the script `prediction-test.py` to evaluate the model's test performance (file produced through task 7).
+
 ## Datasets
 
 ### Fine-tuning Dataset (Training)
