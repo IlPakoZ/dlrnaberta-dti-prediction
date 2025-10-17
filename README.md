@@ -25,7 +25,7 @@ The model is composed of three parts:
 
 ## Requirements
 
-Use a Python version <b>3.11<b> and install the requirements.txt file in this folder.
+Use a Python version <b>3.11</b> and install the requirements.txt file in this folder.
 Separate CUDA installation is required to run the model on a GPU.
 
 Pretrained models and datasets are not uploaded in the repository directly. Instead, they are released as .zip package in the "Releases" section of this repository. Move the extracted folders in the cloned repository folder for immediate use.
