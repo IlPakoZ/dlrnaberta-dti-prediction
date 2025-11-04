@@ -28,32 +28,40 @@ The model is composed of three parts:
 Use a Python version <b>3.11</b> and install the requirements.txt file in this folder.
 Separate CUDA installation is required to run the model on a GPU.
 
+If you plan to try to run the model without using the requirements.txt file, make sure you install mup through the following command:<br>
+```pip install mup```
+
 Pretrained models and datasets are not uploaded in the repository directly. Instead, they are released as .zip package in the "Releases" section of this repository. Move the extracted folders in the cloned repository folder for immediate use.
 
 ## How to use
 
 ```python
-from modeling_dlmberta import InteractionModelATTNForRegression, StdScaler
-from configuration_dlmberta import InteractionModelATTNConfig
-from transformers import AutoModel, RobertaModel, AutoConfig
-from chemberta import ChembertaTokenizer
+from transformers import AutoModel, RobertaModel, AutoConfig, AutoTokenizer
+from model import ChembertaTokenizer
+from model import InteractionModelATTNConfig, InteractionModelATTNForRegression, StdScaler
+import torch
 
+# Define paths
+model_path = "model"
 # Load model components
-config = InteractionModelATTNConfig.from_pretrained("path/to/model")
+config = InteractionModelATTNConfig.from_pretrained(model_path)
+
 # Load encoders
 target_encoder = AutoModel.from_pretrained("IlPakoZ/RNA-BERTa9700")
+target_tokenizer = AutoTokenizer.from_pretrained("IlPakoZ/RNA-BERTa9700")
+drug_tokenizer = ChembertaTokenizer(f"{model_path}/vocab.json")
 
 drug_encoder_config = AutoConfig.from_pretrained("DeepChem/ChemBERTa-77M-MTR")
 drug_encoder_config.pooler = None
 drug_encoder = RobertaModel(config=drug_encoder_config, add_pooling_layer=False)
 
-# Load scaler (if available)
+# Load scaler
 scaler = StdScaler()
-scaler.load("path/to/model")
+scaler.load(f"{model_path}")
 
 # Initialize model
 model = InteractionModelATTNForRegression.from_pretrained(
-    "path/to/model",
+    "model",
     config=config,
     target_encoder=target_encoder,
     drug_encoder=drug_encoder,
@@ -68,11 +76,14 @@ drug_smiles = "C1=CC=C(C=C1)NC(=O)C2=CC=CC=N2"
 target_inputs = target_tokenizer(target_sequence, padding="max_length", truncation=True, max_length=512, return_tensors="pt")
 drug_inputs = drug_tokenizer(drug_smiles, padding="max_length", truncation=True, max_length=512, return_tensors="pt")
 
+model.eval()
+
 # Predict
 with torch.no_grad():
     prediction = model(target_inputs, drug_inputs)
-    if model.scaler:
-        prediction = model.unscale(prediction)
+    prediction = model.unscale(prediction)
+
+print(prediction)
 ```
         
 You can run the script `test-author-model.py` to evaluate Krishnan et. al.[^4] model performance.
