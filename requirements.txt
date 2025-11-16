@@ -1,11 +1,14 @@
-fairseq
 datasets
 dataclasses
 torchmetrics
 numba
 librosa
-deepspeed
 mpi4py
 optuna
 peft
 bitsandbytes
+torch==2.5.1
+transformers==4.46.3
+accelerate==1.2.0
+-e git+https://github.com/microsoft/mup.git#egg=mup
+-e git+https://github.com/microsoft/mutransformers.git#egg=mutransformers
