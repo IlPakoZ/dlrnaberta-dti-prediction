@@ -89,6 +89,9 @@ print(prediction)
 You can run the script `test-author-model.py` to evaluate Krishnan et. al.[^4] model performance.
 You can run the script `prediction-test.py` to evaluate the model's test performance (file produced through task 7).
 
+## Use through Google Colab
+Alternatively, to avoid the setup process, you can run the model through [this Google Colab notebook](https://colab.research.google.com/drive/1uHXBQ6XXNsRbc2sDnFM-y2iNwG7h3ZxN?usp=sharing). To use it, create a copy of the notebook in your Google Drive and execute it with your own input sequences and SMILES. The notebook includes examples demonstrating how to run the model in evaluation mode within Python. It is fully compatible with both CPU and CUDA environments.
+
 ## Datasets
 
 ### Fine-tuning Dataset (Training)
