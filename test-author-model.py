@@ -135,7 +135,6 @@ def compute_pseudo_dnc(seqs, prop_df, lambda_val=8, w_val=0.5):
         all_feats.append(f1 + f2)
 
     # assemble into a DataFrame
-    import pandas as pd
     feat_df = pd.DataFrame(all_feats, columns=di_strings + dnc_feat_names)
 
     print(feat_df)
@@ -339,7 +338,6 @@ def evaluate_mvrm_mirna(to_predict_csv):
 
 
 
-
 def evaluate_mvrm_general_viral(to_predict_csv):
     # 1. load & filter viral
     df    = pd.read_csv(to_predict_csv)
@@ -347,6 +345,7 @@ def evaluate_mvrm_general_viral(to_predict_csv):
     
     # 2. pull raw sequences & clean them → seqs_new
     raw_seqs = viral["Target_RNA_sequence"].astype(str)
+    
     seq_repl = {"X":"A","N":"A"," ":"","R":"G","Y":"C","K":"G",
                 "M":"A","S":"G","W":"A","B":"G","D":"G","H":"A","V":"G"}
     seqs_new = []
@@ -433,6 +432,7 @@ def evaluate_mvrm_general_viral(to_predict_csv):
 def evaluate_mvrm_riboswitches(to_predict_csv, prop_data_tsv):
     # 1. load & filter riboswitches
     df    = pd.read_csv(to_predict_csv)
+
     mirna = df[df["Dataset"].str.contains("Riboswi", na=False)].copy()
     
     # 2. pull raw sequences & clean them → seqs_new

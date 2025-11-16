@@ -3,7 +3,11 @@ from sklearn.metrics import precision_score, recall_score, roc_auc_score, f1_sco
 
 def calculate_metrics():
     df = pd.read_csv("test_predictions.csv")
+<<<<<<< HEAD
     all_predicts = pd.read_csv("data/task7/to_predict.csv")
+=======
+    all_predicts = pd.read_csv("to_predict.csv")
+>>>>>>> 21af665fb5d4ed7921f67f6e35fbf7222e918a85
     
     # Merge on "SMILES", "Target_RNA_sequence"
     df = df.merge(all_predicts[["SMILES", "Target_RNA_sequence", "Dataset"]], on=["SMILES", "Target_RNA_sequence"], how="left")
