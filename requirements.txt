@@ -6,6 +6,9 @@ librosa
 mpi4py
 optuna
 bitsandbytes
+rdkit
+mordred
+viennarna
 transformers==4.46.3
 peft==0.10.0
 torch==2.5.1
