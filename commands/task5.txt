@@ -1,0 +1,1 @@
+python3 main.py -t 5 -k "/data/toktrain/train.txt" 

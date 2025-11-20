@@ -1,0 +1,1 @@
+python3 main.py --path="data/" -t 9 --load_weights="saves/" --device="cpu"

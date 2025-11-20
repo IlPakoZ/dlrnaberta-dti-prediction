@@ -29,11 +29,17 @@ Use a Python version <b>3.11</b> and install the requirements.txt file in this f
 Separate CUDA installation is required to run the model on a GPU.
 
 If you plan to try to run the model without using the requirements.txt file, make sure you install mup through the following command:<br>
-```pip install mup```
+```
+pip install mup
+```
 
-Pretrained models and datasets are not uploaded in the repository directly. Instead, they are released as .zip package in the "Releases" section of this repository. Move the extracted folders in the cloned repository folder for immediate use.
+Pretrained models and datasets are not uploaded in the repository directly. Instead, they are released as .zip and .tar.gz package in the "Releases" section of this repository. Move the extracted folders in the cloned repository folder for immediate use.
 
 ## How to use
+
+### Use through your own script
+
+After you satisfied the requirements, you can use the model in your own python scripts by importing the `model` library. Below a code snapshot to run model prediction on a single target and molecule.
 
 ```python
 from transformers import AutoModel, RobertaModel, AutoConfig, AutoTokenizer
@@ -41,32 +47,37 @@ from model import ChembertaTokenizer
 from model import InteractionModelATTNConfig, InteractionModelATTNForRegression, StdScaler
 import torch
 
+# Define device
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Using device: {device}")
+
 # Define paths
-model_path = "model"
+model_path = "saves"
 # Load model components
 config = InteractionModelATTNConfig.from_pretrained(model_path)
 
 # Load encoders
 target_encoder = AutoModel.from_pretrained("IlPakoZ/RNA-BERTa9700")
 target_tokenizer = AutoTokenizer.from_pretrained("IlPakoZ/RNA-BERTa9700")
-drug_tokenizer = ChembertaTokenizer(f"{model_path}/vocab.json")
+drug_tokenizer = ChembertaTokenizer(f"chemberta/vocab.json")
 
 drug_encoder_config = AutoConfig.from_pretrained("DeepChem/ChemBERTa-77M-MTR")
 drug_encoder_config.pooler = None
 drug_encoder = RobertaModel(config=drug_encoder_config, add_pooling_layer=False)
 
-# Load scaler
+# Load scaler (if available)
 scaler = StdScaler()
 scaler.load(f"{model_path}")
 
 # Initialize model
 model = InteractionModelATTNForRegression.from_pretrained(
-    "model",
+    model_path,
     config=config,
     target_encoder=target_encoder,
     drug_encoder=drug_encoder,
     scaler=scaler
-)
+).to(device)
+
 
 # Make predictions
 target_sequence = "AUGCGAUCGACGUACGUUAGCCGUAGCGUAGCUAGUGUAGCUAGUAGCU"
@@ -80,17 +91,45 @@ model.eval()
 
 # Predict
 with torch.no_grad():
-    prediction = model(target_inputs, drug_inputs)
-    prediction = model.unscale(prediction)
+    # Move inputs to the correct device
+    target_inputs.to(device)
+    drug_inputs.to(device)
 
-print(prediction)
+    prediction = model(target_inputs, drug_inputs).cpu()
+    if model.model.scaler:
+        prediction = model.unscale(prediction)
+
+print(f"Predicted pKd: {prediction[0][0]:.2f}")
 ```
         
 You can run the script `test-author-model.py` to evaluate Krishnan et. al.[^4] model performance.
 You can run the script `prediction-test.py` to evaluate the model's test performance (file produced through task 7).
 
-## Use through Google Colab
+For examples on how to interact with the model through the various pre-implemented tasks in the `main.py` file, refer to folder `commands`. Here you can find the commands we used during the development of the project.
+
+### Use through Google Colab
 Alternatively, to avoid the setup process, you can run the model through [this Google Colab notebook](https://colab.research.google.com/drive/1uHXBQ6XXNsRbc2sDnFM-y2iNwG7h3ZxN?usp=sharing). To use it, create a copy of the notebook in your Google Drive and execute it with your own input sequences and SMILES. The notebook includes examples demonstrating how to run the model in evaluation mode within Python. It is fully compatible with both CPU and CUDA environments.
+
+### Use through Docker
+A Dockerfile based on linux kernel is available in the repository and allows you to build a Docker container with everything pre-installed and configured to run the model. Make sure you have at least 15G of free space on you disk and are on a Linux based system. Alternatively, you can use WSL or Docker Desktop on Windows with Linux virtualization.<br>
+First, make sure to clone the repository and open a terminal in the directory. You can do it on GitHub or using the command:
+```
+git clone https://github.com/IlPakoZ/dlrnaberta-dti-prediction.git && cd dlrnaberta-dti-prediction
+```
+
+Then, download the general model and dataset .zip/.tar package and decompress it in the repository. You can use the command:
+```
+wget https://github.com/IlPakoZ/dlrnaberta-dti-prediction/releases/download/general/general-model.tar.gz
+tar -xzf general-model.tar.gz
+```
+
+Finally, build the Docker image from the current directory, create a container, and run it in interactive mode using:
+```
+docker build -t dlrnaberta-dti .
+docker run -it dlrnaberta-dti
+```
+
+After running the container, you will have access to all files and can run the model through `main.py` or write your own scripts to interact with the model.
 
 ## Datasets
 

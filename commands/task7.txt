@@ -1,0 +1,1 @@
+python3  main.py --path="data" -t 7 --load_weights="saves" --input="data/task7/to_predict.csv" -d "cpu" -o "test_predictions.csv"

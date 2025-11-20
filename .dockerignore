@@ -1,0 +1,11 @@
+# .dockerignore
+general-model.zip
+general-model.tar
+general-model.tar.gz
+*.log
+__pycache__
+.git
+imgs
+.gitignore
+prototype
+README.md

@@ -1,0 +1,17 @@
+python3  main.py --path="data" -t 2 --lr 0.000159 --weight_decay=0.0021 --attention_do=0.0157 --hidden_do=0.0652 --decay_ratio=2 --compute_weights --finetune_data="aptamers.csv"
+
+python3 main.py --path="data" -t 2 --lr 0.000195 --weight_decay=0.000190 --attention_do=0.183 --hidden_do=0.117 --decay_ratio=2 --compute_weights --finetune_data="riboswitch.csv"
+
+python3 main.py --path="data" -t 2 --lr 9.98e-05 --weight_decay=0.00128 --attention_do=0.039 --hidden_do=0.137 --decay_ratio=3 --compute_weights --finetune_data="ribosomal.csv"
+
+python3 main.py --path="data" -t 2 --lr 0.000242 --weight_decay=0.00025 --attention_do=0.296 --hidden_do=0.206 --decay_ratio=1 --compute_weights --finetune_data="repeats.csv"
+
+python3 main.py --path="data" -t 2 --lr 0.000257 --weight_decay=0.000291 --attention_do=0.151 --hidden_do=0.0658 --decay_ratio=3 --compute_weights --finetune_data="viral_rna.csv"
+
+python3  main.py --path="data" -t 2 --lr 0.000155 --weight_decay=0.00536 --attention_do=0.130 --hidden_do=0.073 --decay_ratio=3 --compute_weights --finetune_data="miRNA.csv"
+
+python3 main.py --path="data" -t 2 --lr 1.06e-4 --weight_decay=1.31e-3 --attention_do=0.391 --hidden_do=0.078 --decay_ratio=3 --compute_weights
+
+python3 main.py --path="data" -t 2 --lr 1.02e-4 --weight_decay=1.67e-3 --attention_do=0.425 --hidden_do=0.082 --decay_ratio=2 --compute_weights
+
+python3 main.py --path="data" -t 2 --lr 8.67e-5 --weight_decay=2.24e-3 --attention_do=0.249 --hidden_do=0.185 --decay_ratio=2 --compute_weights

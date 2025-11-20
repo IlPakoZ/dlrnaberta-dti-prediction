@@ -1,0 +1,7 @@
+python3 main.py --path="data" -t 1 --lr=0.000473 --warmup=0.153
+
+python3 main.py --path="data" -t 1 --lr=0.00063 --warmup=0.153
+
+# Final model
+
+python3 main.py --path="data" -t 1 --lr=0.000552 --warmup=0.153 --full

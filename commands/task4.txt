@@ -1,0 +1,13 @@
+python3  main.py --path="data" -t 4 --finetune_data="aptamers.csv" --compute_weights
+
+python3 main.py --path="data" -t 4 --finetune_data="riboswitch.csv" --compute_weights
+
+python3 main.py --path="data" -t 4 --finetune_data="ribosomal.csv" --compute_weights
+
+python3  main.py --path=data" -t 4 --finetune_data="repeats.csv" --compute_weights
+
+python3  main.py --path="data" -t 4 --finetune_data="viral_rna.csv" --compute_weights
+
+python3 main.py --path="data" -t 4 --finetune_data="miRNA.csv" --compute_weights
+
+python3 main.py --path="data" -t 4 --finetune_data="all_folds.csv" --split="random" --compute_weights

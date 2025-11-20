@@ -1,0 +1,5 @@
+python3 main.py --path="data" -t 6 --lr 1.06e-4 --weight_decay=1.31e-3 --attention_do=0.391 --hidden_do=0.078 --decay_ratio=3 --compute_weights
+
+python3 main.py --path="data" -t 6 --lr 1.02e-4 --weight_decay=1.67e-3 --attention_do=0.425 --hidden_do=0.082 --decay_ratio=2 --compute_weights
+
+python3 main.py --path="data" -t 6 --lr 8.67e-5 --weight_decay=2.24e-3 --attention_do=0.249 --hidden_do=0.185 --decay_ratio=2 --compute_weight
