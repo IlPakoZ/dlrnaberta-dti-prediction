@@ -2,3 +2,6 @@ prototype/data
 prototype/dataset
 prototype/pretrained
 prototype/*.csv
+data
+__pycache__
+saves

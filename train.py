@@ -1,4 +1,6 @@
 
+from enum import Enum
+
 from tokenizers.implementations import CharBPETokenizer
 from tokenizers.processors import BertProcessing
 from torchmetrics.regression import R2Score, MeanAbsoluteError, PearsonCorrCoef
@@ -37,6 +39,19 @@ import gc
 import psutil
 import warnings
 import torch.nn._reduction as _Reduction
+
+plt.rcParams.update({
+    'axes.labelsize': 13,    # x/y axis labels (xlabel, ylabel)
+    'xtick.labelsize': 12,   # x-axis tick labels
+    'ytick.labelsize': 12,   # y-axis tick labels
+    'legend.fontsize': 13,   # legend text
+    'axes.titlesize': 15,    # plot title
+})
+
+class ModelType(Enum):
+    STANDARD = 0,
+    CONCAT = 1,
+    SIMPLE_POOL = 2
 
 creation_time = datetime.now().strftime('%Y%m%d_%H%M%S%f')
 PLOT_DIR = f"plots/{creation_time}"
@@ -671,7 +686,7 @@ def mse_loss(
         )
     
 
-def load_finetuned_model(path, directory, train=False):
+def load_finetuned_model(path, directory, train=False, model_type=ModelType.STANDARD):
     
     train_dataset = md.InterDataset.load(directory+"/train")
     val_dataset = md.InterDataset.load(directory+"/val")
@@ -679,7 +694,7 @@ def load_finetuned_model(path, directory, train=False):
         train_parameters = pickle.load(f)
     scaler = md.StdScaler()
     scaler.load(directory)
-    accelerator, model = create_finetune_model(train_parameters, path, scaler, load_weights=None, pretrained=directory)
+    accelerator, model = create_finetune_model(train_parameters, path, scaler, load_weights=None, pretrained=directory, model_type=model_type)
     if not train:
         del accelerator
         accelerator = None 
@@ -775,7 +790,7 @@ def __prepare_train_val_datasets__(drug_tokenizer, target_tokenizer, train_X, va
     return train_dataset, val_dataset
 
 
-def crossvalidate(X, y, n_split, train_parameters, scaler, classes, short_mode=False, path=None, use_best_scores=False, compute_weights=False, split_type="random"):
+def crossvalidate(X, y, n_split, train_parameters, scaler, classes, short_mode=False, path=None, use_best_scores=False, compute_weights=False, split_type="random", model_type=ModelType.STANDARD):
     """
         Executes finetuning with crossvalidation.
 
@@ -811,7 +826,7 @@ def crossvalidate(X, y, n_split, train_parameters, scaler, classes, short_mode=F
             
                 
             print_if_0_rank(f"Fold {i+1}: Creating finetuning_model...")
-            accelerator, finetune_model = create_finetune_model(train_parameters, path, scaler)
+            accelerator, finetune_model = create_finetune_model(train_parameters, path, scaler, model_type=model_type)
             print("FINETUNE:", finetune_model)
             scores, finetune_model, best_scores, best_finetune_model, difference_validation_train = finetune_and_evaluate(finetune_model, accelerator, train_parameters, train_dataset, val_dataset, False)
             differences.append(difference_validation_train)
@@ -1014,7 +1029,7 @@ def __get_tokenizers__():
 
     return target_tokenizer, drug_tokenizer
 
-def create_finetune_model(train_parameters, path, scaler=None, load_weights=None, pretrained=None):
+def create_finetune_model(train_parameters, path, scaler=None, load_weights=None, pretrained=None, model_type=ModelType.STANDARD):
     """
     Loads pretrained encoders and prepares the full interaction model for finetuning.
 
@@ -1052,12 +1067,26 @@ def create_finetune_model(train_parameters, path, scaler=None, load_weights=None
     torch.cuda.empty_cache()
 
     if not pretrained:
-        config = md.InteractionModelATTNConfig(train_parameters["attention_dropout"], train_parameters["hidden_dropout"])
-        model = md.InteractionModelATTNForRegression(config, target_encoder, drug_encoder, scaler)
+        if model_type == ModelType.STANDARD:
+            config = md.InteractionModelATTNConfig(train_parameters["attention_dropout"], train_parameters["hidden_dropout"])
+            model = md.InteractionModelATTNForRegression(config, target_encoder, drug_encoder, scaler)
+        elif model_type == ModelType.CONCAT:
+            config = md.InteractionModelConcatConfig(train_parameters["attention_dropout"], train_parameters["hidden_dropout"])
+            model = md.InteractionModelConcatForRegression(config, target_encoder, drug_encoder, scaler)
+        elif model_type == ModelType.SIMPLE_POOL:
+            config = md.InteractionModelATTNSimplePoolingConfig(train_parameters["attention_dropout"], train_parameters["hidden_dropout"])
+            model = md.InteractionModelATTNSimplePoolingForRegression(config, target_encoder, drug_encoder, scaler)
     else: 
-        config = md.InteractionModelATTNConfig.from_pretrained(pretrained)
-        model = md.InteractionModelATTNForRegression.from_pretrained(pretrained, target_encoder=target_encoder, drug_encoder=drug_encoder, scaler=scaler)
-
+        if model_type == ModelType.STANDARD:
+            config = md.InteractionModelATTNConfig.from_pretrained(pretrained)
+            model = md.InteractionModelATTNForRegression.from_pretrained(pretrained, target_encoder=target_encoder, drug_encoder=drug_encoder, scaler=scaler)
+        elif model_type == ModelType.CONCAT:
+            config = md.InteractionModelConcatConfig.from_pretrained(pretrained)
+            model = md.InteractionModelConcatForRegression.from_pretrained(pretrained, target_encoder=target_encoder, drug_encoder=drug_encoder, scaler=scaler)
+        elif model_type == ModelType.SIMPLE_POOL:
+            config = md.InteractionModelATTNSimplePoolingConfig.from_pretrained(pretrained)
+            model = md.InteractionModelATTNSimplePoolingForRegression.from_pretrained(pretrained, target_encoder=target_encoder, drug_encoder=drug_encoder, scaler=scaler)
+            
     if load_weights:
         model.load_state_dict(torch.load(load_weights))
         
@@ -1117,7 +1146,7 @@ def make_bsh(filename=None):
     base_shapes = make_base_shapes(base_model, delta_model, savefile=filename)
     return base_shapes
 
-def finetune_objective(trial, X, y, n_split, scaler, classes, short_mode, path, compute_weights=False, split_type="random"):
+def finetune_objective(trial, X, y, n_split, scaler, classes, short_mode, path, compute_weights=False, split_type="random", model_type=ModelType.STANDARD):
     
     has_local = "LOCAL_RANK" in os.environ
     
@@ -1182,7 +1211,7 @@ def finetune_objective(trial, X, y, n_split, scaler, classes, short_mode, path, 
         "target_epochs":100,
     })
 
-    results, difference = crossvalidate(X, y, n_split, train_parameters, scaler, classes, short_mode, path=path, compute_weights=compute_weights, split_type=split_type)
+    results, difference = crossvalidate(X, y, n_split, train_parameters, scaler, classes, short_mode, path=path, compute_weights=compute_weights, split_type=split_type, model_type=model_type)
     multipl = (2 ** (results["MeanAbsoluteError"][0] - 0.5)) / 2 + 0.2 * (results["MeanAbsoluteError"][0] - 0.5) ** 2 + 0.5
     difference = multipl * difference
     plt.close('all')  # Close all open figures
@@ -1190,7 +1219,7 @@ def finetune_objective(trial, X, y, n_split, scaler, classes, short_mode, path, 
     return np.mean(results["R2Score"][:2]), np.mean([results["MeanAbsoluteError"][0], results["MeanAbsoluteError"][2]]), difference
 
 
-def finetune_optimize(X, y, n_split, scaler, classes, short_mode, path=None, compute_weights=False, optimize_path=None, split_type="random"):
+def finetune_optimize(X, y, n_split, scaler, classes, short_mode, path=None, compute_weights=False, optimize_path=None, split_type="random", model_type=ModelType.STANDARD):
     """
     Uses Optuna's TPESampler to optimize finetuning hyperparameters through cross-validation.
 
@@ -1256,10 +1285,10 @@ def finetune_optimize(X, y, n_split, scaler, classes, short_mode, path=None, com
 
     print("Starting optimization...")
     if rank == 0:
-        study.optimize(lambda trial: finetune_objective(trial, X, y, n_split, scaler, classes, short_mode, path, compute_weights=compute_weights, split_type=split_type), n_trials=n_trials, n_jobs=1)
+        study.optimize(lambda trial: finetune_objective(trial, X, y, n_split, scaler, classes, short_mode, path, compute_weights=compute_weights, split_type=split_type, model_type=model_type), n_trials=n_trials, n_jobs=1)
     else:
         for i in range(n_trials):
-            finetune_objective(i, X, y, n_split, scaler, classes, short_mode, path, compute_weights, split_type=split_type)
+            finetune_objective(i, X, y, n_split, scaler, classes, short_mode, path, compute_weights, split_type=split_type, model_type=model_type)
     if has_local:
         torch.distributed.barrier()
 

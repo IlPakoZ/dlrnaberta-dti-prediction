@@ -133,6 +133,49 @@ class ChembertaTokenizer:
         if isinstance(ids, int):
             return self.tokenizer.id_to_token(ids)
         
+class InteractionModelATTNSimplePoolingConfig(PretrainedConfig):
+    def __init__(self, attention_dropout = 0.2, hidden_dropout = 0.2, num_heads = 1, **kwargs,):
+        self.num_heads = num_heads
+        self.hidden_dropout = hidden_dropout
+        self.attention_dropout = attention_dropout
+        super().__init__(**kwargs)
+
+class InteractionModelATTNSimplePoolingForRegression(PreTrainedModel):
+    config_class = InteractionModelATTNSimplePoolingConfig
+
+    def __init__(self, config, target_encoder, drug_encoder, scaler):
+        super().__init__(config)
+        self.model = InteractionModelATTNSimplePooling(target_encoder, 
+                                          drug_encoder,
+                                          scaler,
+                                          config.attention_dropout,
+                                          config.hidden_dropout,
+                                          config.num_heads)
+    
+    def forward(self, x1, x2):
+        return self.model(x1, x2)
+
+    def unscale(self, x):
+        return self.model.unscale(x)
+    
+    def INTERPR_ENABLE_MODE(self):
+        """
+        Enables the interpretability mode for the model.
+        """
+        self.model.INTERPR_ENABLE_MODE()
+
+    def INTERPR_DISABLE_MODE(self):
+        """
+        Enables the interpretability mode for the model.
+        """
+        self.model.INTERPR_ENABLE_MODE()
+
+    def INTERPR_OVERRIDE_ATTN(self, new_weights):
+        self.model.INTERPR_OVERRIDE_ATTN(new_weights)
+
+    def INTERPR_RESET_OVERRIDE_ATTN(self):
+        self.model.INTERPR_RESET_OVERRIDE_ATTN()
+        
 # The key is the drug because it binds to the target (like the key of a lock)
 class InteractionModelATTNConfig(PretrainedConfig):
     def __init__(self, attention_dropout = 0.2, hidden_dropout = 0.2, num_heads = 1, **kwargs,):
@@ -166,6 +209,32 @@ class InteractionModelATTNForRegression(PreTrainedModel):
     def INTERPR_RESET_OVERRIDE_ATTN(self):
         self.model.INTERPR_RESET_OVERRIDE_ATTN()
 
+    def forward(self, x1, x2):
+        return self.model(x1, x2)
+
+    def unscale(self, x):
+        return self.model.unscale(x)
+    
+# The key is the drug because it binds to the target (like the key of a lock)
+class InteractionModelConcatConfig(PretrainedConfig):
+    def __init__(self, attention_dropout = 0.2, hidden_dropout = 0.2, num_heads = 1, **kwargs,):
+        self.num_heads = num_heads
+        self.hidden_dropout = hidden_dropout
+        self.attention_dropout = attention_dropout
+        super().__init__(**kwargs)
+
+class InteractionModelConcatForRegression(PreTrainedModel):
+    config_class = InteractionModelConcatConfig
+
+    def __init__(self, config, target_encoder, drug_encoder, scaler):
+        super().__init__(config)
+        self.model = InteractionModelConcat(target_encoder, 
+                                          drug_encoder,
+                                          scaler,
+                                          config.attention_dropout,
+                                          config.hidden_dropout,
+                                          config.num_heads)
+    
     def forward(self, x1, x2):
         return self.model(x1, x2)
 
@@ -272,6 +341,271 @@ class CrossAttention(nn.Module):
 
         return output, attn_weights
 
+class InteractionModelConcat(nn.Module):
+    def __init__(self, target_encoder, drug_encoder, scaler, attention_dropout, hidden_dropout, num_heads=1, kernel_size=1):
+        super().__init__()
+        self.replace_weights = None
+        self.crossattention_weights = None
+        self.presum_layer = None
+        self.INTERPR_MODE = False
+
+        self.scaler = scaler
+        self.attention_dropout = attention_dropout
+        self.hidden_dropout = hidden_dropout
+
+        self.target_encoder = target_encoder
+        self.drug_encoder = drug_encoder
+        self.kernel_size = kernel_size
+        self.lin_map_target = nn.Linear(512, 384)
+        self.dropout_map_target = nn.Dropout(hidden_dropout)
+
+        self.lin_map_drug = nn.Linear(384, 384)
+        self.dropout_map_drug = nn.Dropout(hidden_dropout)
+
+        self.norm = nn.LayerNorm(384)
+        self.summary1 = nn.Linear(384, 384)
+        self.summary2 = nn.Linear(384, 1)
+        self.dropout_summary = nn.Dropout(hidden_dropout)
+        self.layer_norm = nn.LayerNorm(384)
+        self.gelu = nn.GELU()
+
+        self.w = Parameter(torch.empty(1024, 1))
+        self.b = Parameter(torch.zeros(1))
+        self.pdng = Parameter(torch.tensor(0.0))  # learnable padding value (0-dimensional)
+
+        xavier_uniform_(self.w)
+
+    def forward(self, x1, x2):     
+        """
+        Forward pass for attention interaction model.
+
+        Args:
+            x1 (dict): A dictionary containing input tensors for the target encoder.
+                Expected keys:
+                    - 'input_ids' (torch.Tensor): Token IDs for the target input.
+                    - 'attention_mask' (torch.Tensor): Attention mask for the target input.
+            x2 (dict): A dictionary containing input tensors for the drug encoder.
+                Expected keys:
+                    - 'input_ids' (torch.Tensor): Token IDs for the drug input.
+                    - 'attention_mask' (torch.Tensor): Attention mask for the drug input.
+
+        Returns:
+            torch.Tensor: A tensor representing the predicted binding affinity.
+        """
+        x1["attention_mask"] = x1["attention_mask"].bool()   # Fix dropout model issue: https://github.com/pytorch/pytorch/issues/86120
+        y1 = self.target_encoder(**x1).last_hidden_state     # The target
+
+        query_mask = x1["attention_mask"].unsqueeze(-1).to(y1.dtype)
+        y1 = y1 * query_mask
+
+        x2["attention_mask"] = x2["attention_mask"].bool()   # Fix dropout model issue: https://github.com/pytorch/pytorch/issues/86120
+        y2 = self.drug_encoder(**x2).last_hidden_state       # The drug
+        key_mask = x2["attention_mask"].unsqueeze(-1).to(y2.dtype)
+        y2 = y2 * key_mask
+        
+        y1 = self.lin_map_target(y1)
+        y1 = self.gelu(y1) 
+        y1 = self.dropout_map_target(y1)
+
+        y2 = self.lin_map_drug(y2)
+        y2 = self.gelu(y2) 
+        y2 = self.dropout_map_drug(y2)
+        
+        out = torch.cat([y1, y2], dim=1)  # Concatenate along the sequence dimension
+
+        out = self.gelu(out)
+        out = self.dropout_summary(out)
+        out = self.summary2(out).squeeze(-1)
+                
+        weighted = out * self.w.squeeze(1)  # [batch, seq_len]
+        concat_mask = torch.cat([x1["attention_mask"], x2["attention_mask"]], dim=1)
+
+        padding_positions = ~concat_mask        # assign learnable pdng to all padding positions
+        weighted = weighted.masked_fill(padding_positions, self.pdng.item())
+
+        # sum across sequence and add bias
+        result = weighted.sum(dim=1, keepdim=True) + self.b
+        return result
+
+    def train(self, mode = True): 
+        super().train(mode)
+        self.target_encoder.train(mode)
+        self.drug_encoder.train(mode)
+        return self
+    
+    def eval(self): 
+        super().eval()
+        self.target_encoder.eval()
+        self.drug_encoder.eval()
+        self.crossattention.eval()
+        return self
+    
+    def unscale(self, x):
+        """
+        Unscales the labels using a scaler. If the scaler is not specified, don't do anything.
+
+        Parameters:
+            target_value: the target values to be unscaled
+        """
+        with torch.no_grad():
+            if self.scaler is None:
+                return x
+            unscaled = self.scaler.inverse_transform(x)
+        return unscaled
+        
+class InteractionModelATTNSimplePooling(nn.Module):
+    def __init__(self, target_encoder, drug_encoder, scaler, attention_dropout, hidden_dropout, num_heads=1, kernel_size=1):
+        super().__init__()
+        self.replace_weights = None
+        self.crossattention_weights = None
+        self.presum_layer = None
+        self.INTERPR_MODE = False
+
+        self.scaler = scaler
+        self.attention_dropout = attention_dropout
+        self.hidden_dropout = hidden_dropout
+
+        self.target_encoder = target_encoder
+        self.drug_encoder = drug_encoder
+        self.kernel_size = kernel_size
+        self.lin_map_target = nn.Linear(512, 384)
+        self.dropout_map_target = nn.Dropout(hidden_dropout)
+
+        self.lin_map_drug = nn.Linear(384, 384)
+        self.dropout_map_drug = nn.Dropout(hidden_dropout)
+
+        self.crossattention = CrossAttention(384, num_heads, attention_dropout, hidden_dropout)
+        self.norm = nn.LayerNorm(384)
+        self.summary1 = nn.Linear(384, 384)
+        self.summary2 = nn.Linear(384, 1)
+        self.dropout_summary = nn.Dropout(hidden_dropout)
+        self.layer_norm = nn.LayerNorm(384)
+        self.gelu = nn.GELU()
+
+        # Only the global bias is kept (the per-position weighted sum + learnable padding are replaced by mean pooling)
+        self.b = Parameter(torch.zeros(1))
+
+    def forward(self, x1, x2):     
+        """
+        Forward pass for attention interaction model (SimplePooling variant).
+
+        Args:
+            x1 (dict): A dictionary containing input tensors for the target encoder.
+                Expected keys:
+                    - 'input_ids' (torch.Tensor): Token IDs for the target input.
+                    - 'attention_mask' (torch.Tensor): Attention mask for the target input.
+            x2 (dict): A dictionary containing input tensors for the drug encoder.
+                Expected keys:
+                    - 'input_ids' (torch.Tensor): Token IDs for the drug input.
+                    - 'attention_mask' (torch.Tensor): Attention mask for the drug input.
+
+        Returns:
+            torch.Tensor: A tensor representing the predicted binding affinity.
+        """
+        x1["attention_mask"] = x1["attention_mask"].bool()   # Fix dropout model issue: https://github.com/pytorch/pytorch/issues/86120
+        y1 = self.target_encoder(**x1).last_hidden_state     # The target
+
+        query_mask = x1["attention_mask"].unsqueeze(-1).to(y1.dtype)
+        y1 = y1 * query_mask
+
+        x2["attention_mask"] = x2["attention_mask"].bool()   # Fix dropout model issue: https://github.com/pytorch/pytorch/issues/86120
+        y2 = self.drug_encoder(**x2).last_hidden_state       # The drug
+        key_mask = x2["attention_mask"].unsqueeze(-1).to(y2.dtype)
+        y2 = y2 * key_mask
+        
+        y1 = self.lin_map_target(y1)
+        y1 = self.gelu(y1) 
+        y1 = self.dropout_map_target(y1)
+
+        y2 = self.lin_map_drug(y2)
+        y2 = self.gelu(y2) 
+        y2 = self.dropout_map_drug(y2)
+
+        key_padding_mask = (x2["attention_mask"] == 0)
+        
+        replace_weights = None
+        # If in interpretation mode, allow the replacement of cross-attention weights
+        if self.INTERPR_MODE:
+            if self.replace_weights is not None:
+                replace_weights = self.replace_weights
+        
+        out, _ = self.crossattention(y1, y2, y2, key_padding_mask=key_padding_mask, attn_mask=None, replace_weights=replace_weights)
+        
+        # If in interpretation mode, make cross-attention weights and scores accessible from the outside
+        if self.INTERPR_MODE:
+            self.crossattention_weights = _
+            self.scores = self.crossattention.scores
+
+        # Instead of immediately projecting the per-token embeddings (384 dim) to 1
+        # and then doing a learnable weighted sum, we now:
+        # 1. Zero-out padding positions (proper masking)
+        # 2. Mean-pool the cross-attention output embeddings to a single 384-dim vector
+        # 3. Run the same final projection ("the embedding thing": summary1 -> GELU -> dropout -> summary2)
+        out = out * query_mask  # zero padding query positions (they still contain non-zero values after cross-attention)
+        num_tokens = x1["attention_mask"].float().sum(dim=1, keepdim=True).clamp(min=1.0)
+        pooled = out.sum(dim=1) / num_tokens  # (batch_size, 384)
+
+        out = self.summary1(pooled)
+        out = self.gelu(out)
+        out = self.dropout_summary(out)
+        result = self.summary2(out)  # (batch_size, 1)
+        
+        # If in interpretation mode, make final layer output accessible from the outside
+        # (now a scalar per sample instead of per-token contributions)
+        if self.INTERPR_MODE:
+            self.presum_layer = result.squeeze(-1)
+
+        result = result + self.b
+        return result
+
+    def train(self, mode = True): 
+        super().train(mode)
+        self.target_encoder.train(mode)
+        self.drug_encoder.train(mode)
+        self.crossattention.train(mode)
+        return self
+    
+    def eval(self): 
+        super().eval()
+        self.target_encoder.eval()
+        self.drug_encoder.eval()
+        self.crossattention.eval()
+        return self
+    
+    def INTERPR_ENABLE_MODE(self):
+        """
+        Enables the interpretability mode for the model.
+        """
+        if self.training:
+            raise RuntimeError("Cannot enable interpretability mode while the model is training.")
+        self.INTERPR_MODE = True
+
+    def INTERPR_DISABLE_MODE(self):
+        """
+        Disables the interpretability mode for the model.
+        """
+        if self.training:
+            raise RuntimeError("Cannot disable interpretability mode while the model is training.")
+        self.INTERPR_MODE = False
+
+    def INTERPR_OVERRIDE_ATTN(self, new_weights):
+        self.replace_weights = new_weights
+
+    def INTERPR_RESET_OVERRIDE_ATTN(self):
+        self.replace_weights = None
+        
+    def unscale(self, x):
+        """
+        Unscales the labels using a scaler. If the scaler is not specified, don't do anything.
+
+        Parameters:
+            target_value: the target values to be unscaled
+        """
+        with torch.no_grad():
+            if self.scaler is None:
+                return x
+            unscaled = self.scaler.inverse_transform(x)
+        return unscaled
 
 class InteractionModelATTN(nn.Module):
     def __init__(self, target_encoder, drug_encoder, scaler, attention_dropout, hidden_dropout, num_heads=1, kernel_size=1):

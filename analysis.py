@@ -7,6 +7,14 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 
+plt.rcParams.update({
+    'axes.labelsize': 13,    # x/y axis labels (xlabel, ylabel)
+    'xtick.labelsize': 12,   # x-axis tick labels
+    'ytick.labelsize': 12,   # y-axis tick labels
+    'legend.fontsize': 13,   # legend text
+    'axes.titlesize': 15,    # plot title
+})
+
 def print_target_model_infos():
     """
         Prints the number of parameters and the embedding dimension of the target model.
@@ -378,7 +386,7 @@ def plot_presum(tokenized_input, affinities, scaler, w, b, suffix, raw_affinitie
     # Contribution values are included inside each cell, and each cell is labeled with the token it corresponds
     # to (token_str[i]).
 
-    max_per_row = 20
+    max_per_row = 16
 
     n = len(processed_affinities)
     n_rows = int(np.ceil(n / max_per_row))
@@ -409,7 +417,7 @@ def plot_presum(tokenized_input, affinities, scaler, w, b, suffix, raw_affinitie
         r, c = divmod(idx, max_per_row)
         wrapped_token = wrap_text(token_str[idx], width=8)
         ax.text(c, r, f"{val:.2f}\n{wrapped_token}",
-                ha='center', va='center', fontsize=8)
+                ha='center', va='center', fontsize=9)
         
     divider = make_axes_locatable(ax)
     cax = divider.append_axes('bottom', size=0.2, pad=0.3)

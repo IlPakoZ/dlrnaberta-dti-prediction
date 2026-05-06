@@ -10,6 +10,7 @@ from transformers import TrainingArguments, HfArgumentParser
 import evaluate
 from tqdm import tqdm
 import analysis
+from train import ModelType
 
 if __name__ == "__main__":
     # Check if CUDA is available
@@ -44,8 +45,22 @@ if __name__ == "__main__":
     parser.add_argument("--device", "-d", type=str, default="cuda", help="Device to use for prediction (task 7). Default is 'cuda'.")
     parser.add_argument("--cross", action='store_true', default=False, help="If specified, the model will take as input a file with drugs in rows and targets in columns and predict the interactions between each one of them. If false, the file should contain target-drug pairs in .csv format with 'SMILES' and 'Target_RNA_sequence' columns. Default is False.")
     parser.add_argument("--split", type=str, default="random", help="Specify 'random' to use random split, or 'group' to use group splitting based on RNA sequence. Default is 'random'.")
+    parser.add_argument("--concat", action='store_true', default=False, help="If specified, the concatenation model will be trained instead. Applicable to tasks 4, 6 and 7.")
+    parser.add_argument("--simple-pool", action='store_true', default=False, help="If specified, the SimplePooling model (mean-pooling after cross-attention) will be used instead of the standard attention model.  Applicable to tasks 4, 6 and 7.")
     args = parser.parse_args()
 
+    if args.concat and args.simple_pool:
+        print("Error: --concat and --simple-pool cannot be used together.")
+        exit(1)
+
+    model_type = ModelType.STANDARD
+    
+    if args.concat:
+        model_type = ModelType.CONCAT
+    elif args.simple_pool:
+        model_type = ModelType.SIMPLE_POOL
+    
+    print(f"Selected model type: {model_type.name}")
     if args.task == 1:
         if not args.path:
             print("Please, specify the folder containing the training and validation datasets using the -p flag")
@@ -161,7 +176,7 @@ if __name__ == "__main__":
         scaler = model.StdScaler()
         classes = inters["Category"].values
 
-        train.finetune_optimize(X, y, 10, scaler, classes, True, pretrained_model_path, compute_weights=args.compute_weights, optimize_path=args.continue_optimize, split_type=args.split.lower())
+        train.finetune_optimize(X, y, 10, scaler, classes, True, pretrained_model_path, compute_weights=args.compute_weights, optimize_path=args.continue_optimize, split_type=args.split.lower(), model_type=model_type)
 
     elif args.task == 5:
         if not args.tok_file:
@@ -217,7 +232,7 @@ if __name__ == "__main__":
         scaler = model.StdScaler()
         pretrained_model_path = f"{args.path}/pretrained"
         train_dataset, val_dataset = train.__prepare_train_val_datasets__(drug_tokenizer, target_tokenizer, X, X, y, y, scaler, False, weights=classes)
-        accelerator, finetune_model = train.create_finetune_model(train_parameters, pretrained_model_path, scaler)
+        accelerator, finetune_model = train.create_finetune_model(train_parameters, pretrained_model_path, scaler, model_type=model_type)
         scores, finetune_model, best_scores, best_finetune_model, difference_validation_train = train.finetune_and_evaluate(finetune_model, accelerator, train_parameters, train_dataset, val_dataset, True)
     elif args.task == 7:
         # sanity checks
@@ -246,7 +261,7 @@ if __name__ == "__main__":
         target_tokenizer, drug_tokenizer = train.__get_tokenizers__()
         pretrained_model_path = f"{args.path}/pretrained"
         finetune_model, _, train_dataset, val_dataset, scaler = train.load_finetuned_model(
-            pretrained_model_path, args.load_weights
+            pretrained_model_path, args.load_weights, False, model_type=model_type
         )
         finetune_model = finetune_model.to(args.device)
         finetune_model.eval()
